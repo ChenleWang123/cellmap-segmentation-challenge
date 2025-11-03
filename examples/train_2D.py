@@ -23,17 +23,21 @@ from cellmap_segmentation_challenge.models import ResNet, UNet_2D
 
 # %% Set hyperparameters and other configurations
 learning_rate = 0.0001  # learning rate for the optimizer
-batch_size = 8  # batch size for the dataloader
+
+# batch_size = 8  # batch size for the dataloader
+batch_size = 4  # batch size for the dataloader
+
 input_array_info = {
     "shape": (1, 128, 128),
     "scale": (8, 8, 8),
 }  # shape and voxel size of the data to load for the input
-target_array_info = {
-    "shape": (1, 128, 128),
-    "scale": (8, 8, 8),
-}  # shape and voxel size of the data to load for the target
-epochs = 1000  # number of epochs to train the model for
-iterations_per_epoch = 1000  # number of iterations per epoch
+
+# epochs = 1000  # number of epochs to train the model for
+epochs = 10  # number of epochs to train the model for
+
+# iterations_per_epoch = 1000  # number of iterations per epoch
+iterations_per_epoch = 100  # number of iterations per epoch
+
 random_seed = 42  # random seed for reproducibility
 
 classes = ["nuc", "er"]  # list of classes to segment
