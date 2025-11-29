@@ -12,7 +12,10 @@
 echo "Job started on $(hostname)"
 echo "Time: $(date)"
 
-# ===== Activate micromamba (using correct path) =====
+# ===== 1. Initialize micromamba hook (REQUIRED) =====
+eval "$(micromamba shell hook --shell bash)"
+
+# ===== 2. Activate environment =====
 micromamba activate csc
 
 echo "Using Python:"
@@ -20,9 +23,9 @@ which python
 python --version
 
 # ===== Go to correct project directory =====
-cd /home/chwa386g/chwa386g/cellmap-segmentation-challenge/data
+cd /home/chwa386g/chwa386g/cellmap-segmentation-challenge/examples
 
 # ===== Run your script =====
-python main2.py
+python main.py
 
 echo "Job finished at $(date)"
