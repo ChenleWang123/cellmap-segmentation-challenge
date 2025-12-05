@@ -8,15 +8,13 @@
 import os
 import json
 import numpy as np
-import time
-import zarr # type: ignore
-from tqdm import tqdm # type: ignore
-import matplotlib.pyplot as plt # type: ignore
-from scipy.ndimage import gaussian_filter, sobel, laplace # type: ignore
-from sklearn.ensemble import RandomForestClassifier # type: ignore
-from sklearn.model_selection import train_test_split # type: ignore
-from sklearn.metrics import jaccard_score, f1_score # type: ignore
-from sklearn.model_selection import KFold  # type: ignore
+import zarr 
+import matplotlib.pyplot as plt 
+from scipy.ndimage import gaussian_filter, sobel, laplace
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import jaccard_score, f1_score
+from sklearn.model_selection import KFold 
 
 
 # ---------------------------------------------
@@ -26,24 +24,27 @@ from sklearn.model_selection import KFold  # type: ignore
 RAW_S0 = r"../data/jrc_cos7-1a/jrc_cos7-1a.zarr/recon-1/em/fibsem-uint8/s0"
 CROP292_ROOT = r"../data/jrc_cos7-1a/jrc_cos7-1a.zarr/recon-1/labels/groundtruth/crop292"
 
-# 5 classes
-SELECT_CLASSES = {
-    "mito_mem": 3,
-    "mito_lum": 4,
-    "hchrom": 24,
-    "nucpl": 28,
-    "cyto": 35
-}
+# 6 个核相关 atomic class
+NUCLEUS_CLASSES = [
+    "ne_mem",  # 20
+    "ne_lum",  # 21
+    "np_out",  # 22
+    "np_in",  # 23
+    "hchrom",  # 24
+    "nucpl",  # 28
+]
 
-# multi-class mapping：background=0
+# multi-class 映射：背景=0
 CLASS_ID_MAP = {
-    "mito_mem": 1,
-    "mito_lum": 2,
-    "hchrom": 3,
-    "nucpl": 4,
-    "cyto": 5
+    "ne_mem": 1,
+    "ne_lum": 2,
+    "np_out": 3,
+    "np_in": 4,
+    "hchrom": 5,
+    "nucpl": 6,
 }
 
+# 用 nucpl 做 reference（也可以自动选，这里简单固定）
 REF_CLASS = "nucpl"
 REF_S0 = os.path.join(CROP292_ROOT, REF_CLASS, "s0")
 REF_ZATTR = os.path.join(CROP292_ROOT, REF_CLASS, ".zattrs")
@@ -89,13 +90,13 @@ raw_crop = raw_zarr[vz0:vz1, vy0:vy1, vx0:vx1]
 print("Raw crop shape:", raw_crop.shape)
 
 # ---------------------------------------------
-# Step 4. Build multi-class label (0–5) + visualization
+# Step 4. Build multi-class label (0–6) + 可视化
 # ---------------------------------------------
 
 label_multi = np.zeros(ref_zarr.shape, dtype=np.uint8)
 
-print("\n===== Loading 5-class labels =====")
-for cname, real_id in SELECT_CLASSES.items():
+print("\n===== Loading 6-class nucleus labels =====")
+for cname in NUCLEUS_CLASSES:
     path = os.path.join(CROP292_ROOT, cname, "s0")
     arr = zarr.open(path, mode="r")[:]
     cid = CLASS_ID_MAP[cname]
@@ -104,36 +105,73 @@ for cname, real_id in SELECT_CLASSES.items():
 
 print("Unique final multi-class labels:", np.unique(label_multi))
 
+# -------------------------------
+# Step 4 Visualization (new)
+# -------------------------------
+# mid = label_multi.shape[0] // 2 + 1
+# plt.figure(figsize=(18, 10))
+
+# # 逐类单独可视化
+# for i, cname in enumerate(NUCLEUS_CLASSES):
+#     cid = CLASS_ID_MAP[cname]
+#     mask = (label_multi[mid] == cid)
+
+#     plt.subplot(2, 4, i + 1)
+#     plt.imshow(mask, cmap="gray")
+#     plt.title(f"{cname} (class {cid})")
+#     plt.axis("off")
+
+# # 多类别总览图（彩色）
+# plt.subplot(2, 4, 7)
+# plt.imshow(label_multi[mid], cmap="tab10")
+# plt.title("Multi-class nucleus structures (6 classes)")
+# plt.axis("off")
+
+# # 叠加图（raw + label）
+# plt.subplot(2, 4, 8)
+# plt.imshow(raw_crop[mid], cmap='gray')
+# plt.imshow(label_multi[mid], cmap='tab10', alpha=0.45)
+# plt.title("Overlay: Raw + 6-class mask")
+# plt.axis("off")
+
+# plt.tight_layout()
+# plt.show()
+
 # ============================================================
-# Step 5 (Optimized): 3D Feature Extraction (Precomputed)
+# Step 5 (Modified): 3D Feature Extraction
+# 三维特征提取：对每个 z-slice 提取前后层的空间信息
 # ============================================================
-print("\n===== Precomputing 3D Gaussian & Sobel =====")
-
-# ---- Precompute Gaussian ----
-gaussian_vol = gaussian_filter(raw_crop, sigma=1)
-
-# ---- Precompute Sobel ----
-sob_z_vol = sobel(raw_crop, axis=0)
-sob_y_vol = sobel(raw_crop, axis=1)
-sob_x_vol = sobel(raw_crop, axis=2)
-sob_mag_vol = np.sqrt(sob_x_vol**2 + sob_y_vol**2 + sob_z_vol**2)
+import numpy as np
 
 
-def extract_3d_features(z):
+def extract_3d_features(volume, z):
     """
-    Extracts 3 feature channels for slice z (optimized).
+    volume: 3D EM volume (Z,Y,X)
+    z: target slice index
+
+    return: (Y,X,C) feature map | C=3 (raw, gaussian, sobel_mag)
     """
-    raw_ = raw_crop[z]
-    g1 = gaussian_vol[z]
-    sob_mag = sob_mag_vol[z]
 
-    return np.stack([raw_, g1, sob_mag], axis=-1)
+    # -------- 1) raw slice --------
+    raw_ = volume[z]
 
+    # -------- 2) 3D Gaussian (sigma=1) --------
+    g1 = gaussian_filter(volume, sigma=1)[z]
+
+    # -------- 3) 3D Sobel magnitude --------
+    sob_z = sobel(volume, axis=0)[z]
+    sob_y = sobel(volume, axis=1)[z]
+    sob_x = sobel(volume, axis=2)[z]
+    sob_mag = np.sqrt(sob_x**2 + sob_y**2 + sob_z**2)
+
+    # -------- stack 3 feature channels --------
+    feat = np.stack([raw_, g1, sob_mag], axis=-1)  # shape (Y,X,3)
+
+    return feat
 
 
 # ============================================================
 # Step 5.1: Build features for ALL z-slices (stable version)
-# select all layers
 # ============================================================
 
 Z = raw_crop.shape[0]
@@ -147,7 +185,7 @@ y_slices = [None] * Z
 
 # Build 3D features for every z-slice
 for i, z in enumerate(selected_z):
-    feat = extract_3d_features(z)  # (Y,X,3)
+    feat = extract_3d_features(raw_crop, z)  # (Y,X,3)
     lab  = label_multi[z]                   # (Y,X)
 
     # Flatten per-slice for RF training
@@ -155,32 +193,8 @@ for i, z in enumerate(selected_z):
     y_slices[i] = lab.reshape(-1)
 
 
-# # ============================================================
-# # Step 5.1: Build features for SELECTED z-slices only
-# # select n layers
-# # ============================================================
-
-# Z = raw_crop.shape[0]
-
-# # select n layers
-# z_num = 5
-# selected_z = np.linspace(0, Z - 1, z_num, dtype=int)
-
-# print("Selected z-slices:", selected_z)
-
-# X_slices = []
-# y_slices = []
-
-# for z in selected_z:
-#     feat = extract_3d_features(z)  # (400,400,C)
-#     lab = label_multi[z]  # (400,400)
-
-#     X_slices.append(feat.reshape(-1, feat.shape[-1]))
-#     y_slices.append(lab.reshape(-1))
-
-
 # ============================================================
-# Step 6: K-fold Cross Validation (Divided by z layer)
+# Step 6: K-fold Cross Validation (按 z 层划分)
 # ============================================================
 kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -190,9 +204,13 @@ fold_scores = []
 # Step 7: Train & Validate (selected_z only) — Updated Version
 # ============================================================
 
+import time
+from tqdm import tqdm
+from sklearn.metrics import jaccard_score, f1_score
+
 fold_scores = []
 
-labels_eval = [1, 2, 3, 4, 5]   # evaluate only the six nucleus classes
+labels_eval = [1, 2, 3, 4, 5, 6]   # evaluate only the six nucleus classes
 
 # Outer progress bar for K-fold
 for fold, (train_idx, val_idx) in tqdm(
@@ -218,22 +236,16 @@ for fold, (train_idx, val_idx) in tqdm(
     # Step A: Build training set
     # ============================================================
     fold_bar.set_postfix_str("Building train set")
-    X_train = np.concatenate([
-    X_slices[selected_z.tolist().index(z)] for z in train_z])
-    y_train = np.concatenate([
-    y_slices[selected_z.tolist().index(z)] for z in train_z])
+    X_train = np.concatenate([X_slices[z] for z in train_z])
+    y_train = np.concatenate([y_slices[z] for z in train_z])
     fold_bar.update(1)
 
     # ============================================================
     # Step B: Build validation set
     # ============================================================
     fold_bar.set_postfix_str("Building val set")
-    X_val = np.concatenate([
-    X_slices[selected_z.tolist().index(z)] for z in val_z
-])
-    y_val = np.concatenate([
-    y_slices[selected_z.tolist().index(z)] for z in val_z
-])
+    X_val = np.concatenate([X_slices[z] for z in val_z])
+    y_val = np.concatenate([y_slices[z] for z in val_z])
     fold_bar.update(1)
 
     print("Train size:", X_train.shape)
@@ -264,7 +276,7 @@ for fold, (train_idx, val_idx) in tqdm(
     # Step E: Compute evaluation metrics
     # ============================================================
 
-    # Macro IoU & Dice only on 5 nucleus classes
+    # Macro IoU & Dice only on 6 nucleus classes
     iou_macro = jaccard_score(y_val, y_pred, average="macro", labels=labels_eval)
     dice_macro = f1_score(y_val, y_pred, average="macro", labels=labels_eval)
 
@@ -278,7 +290,7 @@ for fold, (train_idx, val_idx) in tqdm(
     )
 
     print("Per-class IoU:")
-    for cname, cid, ciou in zip(SELECT_CLASSES.keys(), labels_eval, per_class_iou):
+    for cname, cid, ciou in zip(NUCLEUS_CLASSES, labels_eval, per_class_iou):
         print(f"  Class {cid:2d} ({cname:7s}) IoU = {ciou:.4f}")
 
     # Fold time
@@ -299,27 +311,8 @@ for k, (iou, dice) in enumerate(fold_scores):
 avg_iou  = np.mean([s[0] for s in fold_scores])
 avg_dice = np.mean([s[1] for s in fold_scores])
 
-print("\nAverage IoU (5 classes) :", avg_iou)
-print("Average Dice (5 classes):", avg_dice)
-
-
-# ============================================================
-# Step 7.5: Train final model on ALL slices
-# ============================================================
-print("\n===== Training final model on ALL data =====")
-
-X_all = np.concatenate(X_slices)
-y_all = np.concatenate(y_slices)
-
-final_clf = RandomForestClassifier(
-    n_estimators=100,
-    class_weight="balanced",
-    n_jobs=-1,
-    random_state=42
-)
-final_clf.fit(X_all, y_all)
-
-print("Final model trained!")
+print("\nAverage IoU (6 classes) :", avg_iou)
+print("Average Dice (6 classes):", avg_dice)
 
 
 # ============================================================
@@ -336,50 +329,44 @@ os.makedirs(save_folder, exist_ok=True)
 
 print(f"\nSaving 10 prediction images into:\n{save_folder}")
 
-# --- define Dy, Dx for reshape ---
-Dz, Dy, Dx = raw_crop.shape
-
 # ---- Select 10 random z slices ----
 num_vis = 10
 vis_z_list = random.sample(range(Z), num_vis)
 print("Selected slices:", vis_z_list)
 
 for vis_z in vis_z_list:
-    # Extract features for this slice
-    feat_vis = extract_3d_features(vis_z)
+    # Extract features
+    feat_vis = extract_3d_features(raw_crop, vis_z)
     X_vis = feat_vis.reshape(-1, feat_vis.shape[-1])
 
-    # Predict full 400×400 segmentation
-    y_pred_vis = final_clf.predict(X_vis).reshape(Dy, Dx)
+    # Predict
+    y_pred_vis = clf.predict(X_vis).reshape(Dy, Dx)
 
     # GT & raw
     y_gt_vis = label_multi[vis_z]
-    raw_vis  = raw_crop[vis_z]
+    raw_vis = raw_crop[vis_z]
 
-    # ---- Visualization ----
-    fig = plt.figure(figsize=(18, 6))
+    # ---- Plot ----
+    fig = plt.figure(figsize=(18,6))
 
     plt.suptitle(f"Slice z={vis_z}", fontsize=16)
 
-    # --- Raw ---
-    plt.subplot(1, 3, 1)
+    plt.subplot(1,3,1)
     plt.title("Raw")
     plt.imshow(raw_vis, cmap='gray')
     plt.axis("off")
 
-    # --- Ground Truth ---
-    plt.subplot(1, 3, 2)
+    plt.subplot(1,3,2)
     plt.title("Ground Truth")
     plt.imshow(y_gt_vis, cmap="tab10")
     plt.axis("off")
 
-    # --- Prediction ---
-    plt.subplot(1, 3, 3)
+    plt.subplot(1,3,3)
     plt.title("Prediction")
     plt.imshow(y_pred_vis, cmap="tab10")
     plt.axis("off")
 
-    # fix title cutoff
+    # Fix title cutoff
     plt.tight_layout(rect=[0, 0, 1, 0.94])
 
     # Save image
