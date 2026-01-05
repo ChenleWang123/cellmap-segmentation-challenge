@@ -16,7 +16,7 @@ echo "Time: $(date)"
 # ===== 1. Initialize micromamba hook (REQUIRED) =====
 eval "$(micromamba shell hook --shell bash)"
 
-# ===== 2. Activate environment =====
+# ===== 2. Activate environment (micromamba activate /home/chwa386g/micromamba/envs/csc) =====
 micromamba activate csc
 
 echo "Using Python:"
@@ -27,6 +27,6 @@ python --version
 cd /home/chwa386g/chwa386g/cellmap-segmentation-challenge/examples
 
 # ===== Run your script =====
-python main.py
+python main_cnn.py
 
 echo "Job finished at $(date)"

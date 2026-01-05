@@ -77,7 +77,7 @@ CLASS_WEIGHTS_LIST = [1.0, 1.0, 10.0, 10.0, 5.0, 5.0]
 REF_CLASS = "nucpl"
 
 # Training
-EPOCHS = 20
+EPOCHS = 300
 BATCH_SIZE = 2
 LR = 2e-4
 WEIGHT_DECAY = 1e-5
@@ -91,6 +91,7 @@ VAL_PATCHES = 80
 INFER_STRIDE = (16, 64, 64)  # overlap = patch - stride
 
 # Output
+N_VAL_SLICES = 10
 from datetime import datetime
 
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -406,23 +407,24 @@ def sliding_window_predict(
 # Train one fold
 # -----------------------------
 def train_one_fold(fold_id, train_crops, val_crops):
-    run_dir = os.path.join(OUT_DIR, f"fold_{fold_id}")
+    # run_dir = os.path.join(OUT_DIR, f"fold_{fold_id}")
+    run_dir = os.path.join(OUT_DIR)
     os.makedirs(run_dir, exist_ok=True)
 
     in_ch = 3 if USE_GRADMAG2_AS_3RD_CH else 2
     model = UNet3D(in_ch=in_ch, n_classes=NUM_CLASSES, base=32).to(DEVICE)
 
-    # === NEW: Class Weights Initialization ===
     class_weights = torch.tensor(CLASS_WEIGHTS_LIST, dtype=torch.float32).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    # === MODIFIED: Pass weights to CrossEntropyLoss ===
     ce = nn.CrossEntropyLoss(weight=class_weights)
 
     train_ds = RandomPatchDataset(
         train_crops, n_patches=PATCHES_PER_EPOCH, patch_zyx=PATCH_ZYX
     )
-    val_ds = RandomPatchDataset(val_crops, n_patches=VAL_PATCHES, patch_zyx=PATCH_ZYX)
+    val_ds = RandomPatchDataset(
+        val_crops, n_patches=VAL_PATCHES, patch_zyx=PATCH_ZYX
+    )
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True
@@ -431,16 +433,22 @@ def train_one_fold(fold_id, train_crops, val_crops):
         val_ds, batch_size=1, shuffle=False, num_workers=1, pin_memory=True
     )
 
+    SAVE_EVERY = 50
     best_val = 1e9
     best_path = os.path.join(run_dir, "best.pt")
 
+    # ===========================
+    # training loop
+    # ===========================
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
         model.train()
         tr_loss = 0.0
 
         for x, y in tqdm(
-            train_loader, desc=f"[Fold {fold_id}] Train epoch {epoch}", leave=False
+            train_loader,
+            desc=f"Train epoch {epoch}",
+            leave=False,
         ):
             x = x.to(DEVICE)
             y = y.to(DEVICE)
@@ -457,12 +465,14 @@ def train_one_fold(fold_id, train_crops, val_crops):
 
         tr_loss /= max(len(train_loader), 1)
 
-        # val
+        # ---------- validation ----------
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
             for x, y in tqdm(
-                val_loader, desc=f"[Fold {fold_id}] Val epoch {epoch}", leave=False
+                val_loader,
+                desc=f"Val epoch {epoch}",
+                leave=False,
             ):
                 x = x.to(DEVICE)
                 y = y.to(DEVICE)
@@ -471,51 +481,75 @@ def train_one_fold(fold_id, train_crops, val_crops):
                     logits, y, num_classes=NUM_CLASSES
                 )
                 va_loss += loss.item()
-        va_loss /= max(len(val_loader), 1)
 
+        va_loss /= max(len(val_loader), 1)
         dt = time.time() - t0
+
         print(
-            f"[Fold {fold_id}] Epoch {epoch:02d} | train={tr_loss:.4f} val={va_loss:.4f} | {dt/60:.2f} min"
+            f"Epoch {epoch:03d} | "
+            f"train={tr_loss:.4f} val={va_loss:.4f} | {dt/60:.2f} min"
         )
 
-        # save best
+        # ---------- best model ----------
         if va_loss < best_val:
             best_val = va_loss
-            torch.save({"model": model.state_dict(), "in_ch": in_ch}, best_path)
+            torch.save(
+                {"model": model.state_dict(), "in_ch": in_ch},
+                best_path,
+            )
 
-    print(f"[Fold {fold_id}] Best val loss: {best_val:.4f} saved to {best_path}")
+        # ---------- periodic checkpoint ----------
+        if epoch % SAVE_EVERY == 0:
+            ckpt_path = os.path.join(run_dir, f"epoch_{epoch:03d}.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "in_ch": in_ch,
+                },
+                ckpt_path,
+            )
 
-    # Evaluate on full validation crop (first val crop only)
+    print(f"Best val loss: {best_val:.4f}")
+
+    # ===========================
+    # full-volume inference on validation crop
+    # ===========================
     ckpt = torch.load(best_path, map_location=DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
     val_crop = val_crops[0]
+
     pred = sliding_window_predict(
-        model, val_crop["raw"], patch_zyx=PATCH_ZYX, stride_zyx=INFER_STRIDE
+        model,
+        val_crop["raw"],
+        patch_zyx=PATCH_ZYX,
+        stride_zyx=INFER_STRIDE,
     )
 
-    # ===== FIX: align pred and GT =====
     gt = val_crop["label"]
 
     Z = min(pred.shape[0], gt.shape[0])
     Y = min(pred.shape[1], gt.shape[1])
     X = min(pred.shape[2], gt.shape[2])
-
     pred = pred[:Z, :Y, :X]
-    gt   = gt[:Z, :Y, :X]
-    # ====================================
+    gt = gt[:Z, :Y, :X]
 
-    dices = dice_per_class(pred, val_crop["label"], num_classes=NUM_CLASSES)
-    print(f"[Fold {fold_id}] Full-volume Dice per class:")
+    dices = dice_per_class(pred, gt, num_classes=NUM_CLASSES)
+    print(f"Full-volume Dice per class:")
     for ci, d in enumerate(dices):
         print(f"  {ci}:{CLASS_NAMES[ci]}  Dice={d:.4f}")
 
-    # Save a few slice visualizations
+    # ===========================
+    # save slice visualizations
+    # ===========================
     vis_dir = os.path.join(run_dir, "vis")
     os.makedirs(vis_dir, exist_ok=True)
+
     Dz = val_crop["raw"].shape[0]
-    zs = [0, Dz // 4, Dz // 2, (3 * Dz) // 4, max(0, Dz - 1)]
+    zs = np.linspace(0, Dz - 1, N_VAL_SLICES, dtype=int)
 
     for z in zs:
         fig = plt.figure(figsize=(18, 6))
@@ -523,16 +557,21 @@ def train_one_fold(fold_id, train_crops, val_crops):
         plt.title("Raw")
         plt.imshow(val_crop["raw"][z], cmap="gray")
         plt.axis("off")
+
         plt.subplot(1, 3, 2)
         plt.title("GT")
         plt.imshow(val_crop["label"][z], cmap="tab10", vmin=0, vmax=9)
         plt.axis("off")
+
         plt.subplot(1, 3, 3)
         plt.title("Pred")
         plt.imshow(pred[z], cmap="tab10", vmin=0, vmax=9)
         plt.axis("off")
+
         plt.tight_layout()
-        outp = os.path.join(vis_dir, f"val_{val_crop['id']}_z{z:04d}.png")
+        outp = os.path.join(
+            vis_dir, f"val_{val_crop['id']}_z{z:04d}.png"
+        )
         plt.savefig(outp, dpi=200)
         plt.close(fig)
 
@@ -544,7 +583,7 @@ def main():
     raw_zarr = zarr.open(RAW_S0, mode="r")
     print("Raw shape:", raw_zarr.shape)
 
-    # Load all crops into RAM (simple & robust; if OOM, we can stream per-epoch)
+    # -------- load crops --------
     all_crops = []
     print("\n===== Loading crops =====")
     for cid in CROP_IDS:
@@ -553,35 +592,25 @@ def main():
         print("  shape:", c["shape"], "labels:", np.unique(c["label"]))
         all_crops.append(c)
 
-    # KFold on crop index
-    crop_indices = np.arange(len(all_crops))
-    kf = KFold(n_splits=len(all_crops), shuffle=True, random_state=SEED)
+    # ===== single fold =====
+    val_idx = 0  # select valid crop
+    train_idx = [i for i in range(len(all_crops)) if i != val_idx]
 
-    fold_losses = []
-    # === NEW: Store all Dice scores for final aggregation ===
-    all_dices = {name: [] for name in CLASS_NAMES}
-    for fold_id, (tr_idx, va_idx) in enumerate(kf.split(crop_indices)):
-        train_crops = [all_crops[i] for i in tr_idx]
-        val_crops = [all_crops[i] for i in va_idx]  # single crop
+    train_crops = [all_crops[i] for i in train_idx]
+    val_crops   = [all_crops[val_idx]]
 
-        print("\n" + "=" * 60)
-        print(
-            f"FOLD {fold_id} | train={[c['id'] for c in train_crops]} | val={[c['id'] for c in val_crops]}"
-        )
-        loss, dices = train_one_fold(fold_id, train_crops, val_crops)
-        fold_losses.append(loss)
-        for i, d in enumerate(dices):
-            all_dices[CLASS_NAMES[i]].append(d)
+    print("\n" + "=" * 60)
+    print(
+        f"SINGLE FOLD | "
+        f"train={[c['id'] for c in train_crops]} | "
+        f"val={[c['id'] for c in val_crops]}"
+    )
 
-    # === NEW: Final K-Fold Summary (Mean and Std Dev) ===
-    print("\n===== K-FOLD FINAL DICE SUMMARY (Mean ± Std Dev) =====")
-    for name, dice_list in all_dices.items():
-        mean_dice = np.mean(dice_list)
-        std_dice = np.std(dice_list)
-        print(f"  {name:10s} | Dice: {mean_dice:.4f} ± {std_dice:.4f}")
+    fold_id = 0
+    loss, dices = train_one_fold(fold_id, train_crops, val_crops)
 
     print("\n===== Done =====")
-    print("Fold best val losses:", fold_losses)
+    print("Best val loss:", loss)
 
 
 if __name__ == "__main__":
