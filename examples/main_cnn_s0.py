@@ -13,15 +13,13 @@ import numpy as np
 import zarr  # type: ignore
 from tqdm import tqdm  # type: ignore
 from scipy.ndimage import gaussian_filter, sobel  # type: ignore
-
 from sklearn.model_selection import KFold  # type: ignore
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
 import matplotlib.pyplot as plt  # type: ignore
+import matplotlib.patches as mpatches
 
 
 # -----------------------------
@@ -352,53 +350,103 @@ def dice_per_class(pred, gt, num_classes=6, eps=1e-6):
 
 
 # -----------------------------
-# Sliding-window inference
+# High-Quality Sliding-window inference (Gaussian + Mirror Padding)
 # -----------------------------
+def _get_gaussian(patch_size, sigma_scale=1.0 / 8):
+    tmp = np.zeros(patch_size)
+    center_coords = [i // 2 for i in patch_size]
+    sigmas = [i * sigma_scale for i in patch_size]
+    tmp[tuple(center_coords)] = 1
+    gaussian_importance_map = gaussian_filter(tmp, sigmas, 0, mode='constant', cval=0)
+    
+    # Normalize
+    gaussian_importance_map = gaussian_importance_map / np.max(gaussian_importance_map) * 1
+    gaussian_importance_map = gaussian_importance_map.astype(np.float32)
+
+    # Gaussian cannot be 0, otherwise division by zero errors
+    gaussian_importance_map[gaussian_importance_map == 0] = np.min(
+        gaussian_importance_map[gaussian_importance_map != 0]
+    )
+    return gaussian_importance_map
+
 @torch.no_grad()
 def sliding_window_predict(
     model, raw_zyx: np.ndarray, patch_zyx=(32, 128, 128), stride_zyx=(16, 64, 64)
 ):
     """
-    raw_zyx: uint8 (Z,Y,X)
-    returns: pred (Z,Y,X) uint8
+    SOTA Inference with Gaussian Blending and Mirror Padding.
+    Eliminates edge artifacts.
     """
     model.eval()
-    C = 3 if USE_GRADMAG2_AS_3RD_CH else 2
-
+    
+    # 1. Pad the input volume to handle edges
+    # We pad by half the patch size to ensure edge pixels can be in the center of a patch
     pz, py, px = patch_zyx
+    pad_z, pad_y, pad_x = pz // 2, py // 2, px // 2
+    
+    # Use 'reflect' to avoid sharp zero-boundaries that confuse InstanceNorm
+    raw_padded = np.pad(
+        raw_zyx, 
+        ((pad_z, pad_z), (pad_y, pad_y), (pad_x, pad_x)), 
+        mode='reflect'
+    )
+    
+    Dz_pad, Dy_pad, Dx_pad = raw_padded.shape
     sz, sy, sx = stride_zyx
-    Dz, Dy, Dx = raw_zyx.shape
 
-    # score accumulation
-    scores = np.zeros((NUM_CLASSES, Dz, Dy, Dx), dtype=np.float32)
-    counts = np.zeros((Dz, Dy, Dx), dtype=np.float32)
+    # 2. Prepare result arrays
+    scores = np.zeros((NUM_CLASSES, Dz_pad, Dy_pad, Dx_pad), dtype=np.float32)
+    # Instead of counting '1', we accumulate the gaussian weights
+    gaussian_weights = np.zeros((Dz_pad, Dy_pad, Dx_pad), dtype=np.float32)
 
-    z_starts = list(range(0, max(Dz - pz, 0) + 1, sz))
-    y_starts = list(range(0, max(Dy - py, 0) + 1, sy))
-    x_starts = list(range(0, max(Dx - px, 0) + 1, sx))
-    if z_starts[-1] != Dz - pz:
-        z_starts.append(Dz - pz)
-    if y_starts[-1] != Dy - py:
-        y_starts.append(Dy - py)
-    if x_starts[-1] != Dx - px:
-        x_starts.append(Dx - px)
+    # 3. Get Gaussian window
+    # This window gives high weight to center, low weight to edges
+    g_window = _get_gaussian(patch_zyx)
+    g_window_torch = torch.from_numpy(g_window).to(DEVICE) # (Z,Y,X)
 
-    for z0 in tqdm(z_starts, desc="Infer z"):
+    # 4. Sliding locations
+    z_starts = list(range(0, max(Dz_pad - pz, 0) + 1, sz))
+    y_starts = list(range(0, max(Dy_pad - py, 0) + 1, sy))
+    x_starts = list(range(0, max(Dx_pad - px, 0) + 1, sx))
+    
+    # Ensure we cover the last bit
+    if z_starts[-1] != Dz_pad - pz: z_starts.append(Dz_pad - pz)
+    if y_starts[-1] != Dy_pad - py: y_starts.append(Dy_pad - py)
+    if x_starts[-1] != Dx_pad - px: x_starts.append(Dx_pad - px)
+
+    # 5. Inference Loop
+    for z0 in tqdm(z_starts, desc="Infer (Gaussian)"):
         for y0 in y_starts:
             for x0 in x_starts:
-                patch_raw = raw_zyx[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+                # Extract patch
+                patch_raw = raw_padded[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+                
+                # Check shape (sanity check)
+                if patch_raw.shape != (pz, py, px):
+                    continue
+
                 x_patch = make_cnn_input(patch_raw)  # (C,Z,Y,X)
                 x = torch.from_numpy(x_patch).unsqueeze(0).to(DEVICE)  # (1,C,Z,Y,X)
 
                 logits = model(x)
-                prob = (
-                    torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-                )  # (K,Z,Y,X)
+                prob = torch.softmax(logits, dim=1).squeeze(0) # (K,Z,Y,X)
 
-                scores[:, z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += prob
-                counts[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += 1.0
+                # --- The Magic: Multiply by Gaussian Window ---
+                prob *= g_window_torch
+                
+                # Accumulate
+                prob_np = prob.cpu().numpy()
+                scores[:, z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += prob_np
+                gaussian_weights[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += g_window
 
-    scores /= np.maximum(counts[None, ...], 1e-6)
+    # 6. Normalize and Crop back
+    # Avoid division by zero
+    gaussian_weights = np.maximum(gaussian_weights, 1e-6)
+    scores /= gaussian_weights[None, ...]
+    
+    # Crop back to original size
+    scores = scores[:, pad_z:-pad_z, pad_y:-pad_y, pad_x:-pad_x]
+    
     pred = np.argmax(scores, axis=0).astype(np.uint8)
     return pred
 
@@ -551,22 +599,52 @@ def train_one_fold(fold_id, train_crops, val_crops):
     Dz = val_crop["raw"].shape[0]
     zs = np.linspace(0, Dz - 1, N_VAL_SLICES, dtype=int)
 
+    # 1. Setup Colormap and Legend Patches
+    # Since your labels are already 0..5, we map them directly to tab10 colors
+    cmap = plt.get_cmap("tab10")
+    
+    legend_patches = []
+    for i, name in enumerate(CLASS_NAMES):
+        # i is 0..5, matches the pixel value in GT/Pred
+        legend_patches.append(mpatches.Patch(color=cmap(i), label=f"{name} ({i})"))
+
     for z in zs:
-        fig = plt.figure(figsize=(18, 6))
+        # Increase figure width to make room for legend
+        fig = plt.figure(figsize=(20, 6))
+
+        # --- Raw ---
         plt.subplot(1, 3, 1)
         plt.title("Raw")
         plt.imshow(val_crop["raw"][z], cmap="gray")
         plt.axis("off")
 
+        # --- GT ---
         plt.subplot(1, 3, 2)
         plt.title("GT")
-        plt.imshow(val_crop["label"][z], cmap="tab10", vmin=0, vmax=9)
+        plt.imshow(val_crop["label"][z], cmap=cmap, vmin=0, vmax=9)
         plt.axis("off")
+        # Add Legend
+        plt.legend(
+            handles=legend_patches,
+            bbox_to_anchor=(1.05, 1),
+            loc='upper left',
+            borderaxespad=0.,
+            title="Classes"
+        )
 
+        # --- Pred ---
         plt.subplot(1, 3, 3)
         plt.title("Pred")
-        plt.imshow(pred[z], cmap="tab10", vmin=0, vmax=9)
+        plt.imshow(pred[z], cmap=cmap, vmin=0, vmax=9)
         plt.axis("off")
+        # Add Legend
+        plt.legend(
+            handles=legend_patches,
+            bbox_to_anchor=(1.05, 1),
+            loc='upper left',
+            borderaxespad=0.,
+            title="Classes"
+        )
 
         plt.tight_layout()
         outp = os.path.join(

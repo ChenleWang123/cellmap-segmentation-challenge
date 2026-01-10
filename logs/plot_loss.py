@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 # python logs/plot_loss.py
 
 # ====== 修改为你的 out 文件路径 ======
-log_file = "logs/main_1923722.out"
+log_file = "logs/main_2230781.out"
 
 epochs = []
 train_losses = []
