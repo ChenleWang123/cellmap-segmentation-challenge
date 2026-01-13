@@ -18,6 +18,15 @@ from scipy.ndimage import gaussian_filter, sobel, laplace  # type: ignore
 from sklearn.ensemble import RandomForestClassifier  # type: ignore
 from sklearn.model_selection import KFold  # type: ignore
 from sklearn.metrics import jaccard_score, f1_score  # type: ignore
+from scipy.ndimage import (
+    maximum_filter,
+    minimum_filter,
+    median_filter,
+)  # 新增 maximum/minimum/median # type: ignore
+from skimage.feature import (
+    hessian_matrix,
+    hessian_matrix_eigvals,
+)  # 新增：需要安装 scikit-image # type: ignore
 
 # ---------------------------------------------
 # Step 1. Setup paths (MODIFIED)
@@ -50,55 +59,38 @@ CLASS_ID_MAP = {
 
 # Class name list for printing results (order MUST match labels_eval)
 CLASS_NAMES_ORDERED = ["cyto", "mito_mem", "mito_lum", "er_mem", "er_lum"]
-labels_eval = [1, 2, 3, 4, 5] # The 5 target class IDs
+labels_eval = [1, 2, 3, 4, 5]  # The 5 target class IDs
 
-REF_CLASS = "nucpl" # Used to determine the bounds/shape of each crop
+REF_CLASS = "nucpl"  # Used to determine the bounds/shape of each crop
 
 raw_zarr = zarr.open(RAW_S0, mode="r")
 print("Raw shape:", raw_zarr.shape)
-
 
 # ============================================================
 # NEW: Function Definition for 3D Feature Extraction (Step 5 logic)
 # ============================================================
 
-def extract_full_3d_features_32ch(vol_3d):
+def extract_full_3d_features_40ch(vol_3d):
     """
-    Expanded feature set (Z, Y, X, 32)
-    Designed for CellMap organelle segmentation.
-    
-    Structure:
-    [0]     Raw Intensity
-    [1-8]   Gaussian Smoothing (sigmas: 0.5, 1, 2, 4, 8, 12, 16, 24)
-    [9-13]  Gradient Magnitude (sigmas: 1, 2, 4, 8, 12)
-    [14-18] Laplacian of Gaussian (LoG) (sigmas: 1, 2, 4, 8, 12)
-    [19-23] Difference of Gaussians (DoG) (1-2, 2-4, 4-8, 8-12, 12-16)
-    [24-26] Hessian Eigenvalues (Small scale, sigma=2) -> Shape info
-    [27-29] Hessian Eigenvalues (Medium scale, sigma=4) -> Shape info
-    [30-31] Local Variance / StdDev (sigma=2, 4)
+    Updated Feature set: 32 Original + 8 New = 40 Channels
     """
-    
     # 1. Normalize Input
     img = vol_3d.astype(np.float32) / 255.0
     features = []
 
-    # Helper: Precompute Gaussians to reuse
-    # Using a geometric progression for scales is often better
+    # Helper: Precompute Gaussians
     sigmas = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0]
     gaussians = {}
-    
-    # --- Group 1: Raw & Gaussians (1 + 8 = 9 channels) ---
-    features.append(img) # Ch 0
-    
+
+    # --- Group 1: Raw & Gaussians (9 channels) ---
+    features.append(img)
     for s in sigmas:
         g = gaussian_filter(img, sigma=s)
         gaussians[s] = g
-        features.append(g) # Ch 1-8
+        features.append(g)
 
     # --- Group 2: Gradient Magnitude (5 channels) ---
-    # Captures edges. We use 3D Sobel approximation on smoothed images.
     def get_grad_mag(smoothed_vol):
-        # 3D Gradient
         gz = sobel(smoothed_vol, axis=0)
         gy = sobel(smoothed_vol, axis=1)
         gx = sobel(smoothed_vol, axis=2)
@@ -106,84 +98,84 @@ def extract_full_3d_features_32ch(vol_3d):
 
     grad_sigmas = [1.0, 2.0, 4.0, 8.0, 12.0]
     for s in grad_sigmas:
-        features.append(get_grad_mag(gaussians[s])) # Ch 9-13
+        features.append(get_grad_mag(gaussians[s]))
 
-    # --- Group 3: Laplacian of Gaussian (LoG) (5 channels) ---
-    # Excellent for blob detection (mitochondria) and edges.
+    # --- Group 3: Laplacian of Gaussian (5 channels) ---
     log_sigmas = [1.0, 2.0, 4.0, 8.0, 12.0]
     for s in log_sigmas:
-        # Laplace of smoothed image
-        l = laplace(gaussians[s])
-        features.append(l) # Ch 14-18
+        features.append(laplace(gaussians[s]))
 
-    # --- Group 4: Difference of Gaussians (DoG) (5 channels) ---
-    # Band-pass filters, effectively selecting structures of specific sizes.
+    # --- Group 4: DoG (5 channels) ---
     dog_pairs = [(1.0, 2.0), (2.0, 4.0), (4.0, 8.0), (8.0, 12.0), (12.0, 16.0)]
     for s1, s2 in dog_pairs:
-        diff = gaussians[s1] - gaussians[s2]
-        features.append(diff) # Ch 19-23
+        features.append(gaussians[s1] - gaussians[s2])
 
-    # --- Group 5: Hessian Eigenvalues (Shape Descriptors) (6 channels) ---
-    # This is computationally heavier but very powerful for distinguishing
-    # sheets (ER) vs tubes (microtubules) vs blobs (vesicles).
-    # We only calculate for 2 key scales to save time.
-    
-    def get_hessian_eigenvalues(smoothed_vol):
-        # Calculate Hessian matrix elements
-        # H = [[Dzz, Dzy, Dzx], [Dyz, Dyy, Dyx], [Dxz, Dxy, Dxx]]
+    # --- Group 5: Hessian Diagonal Approx (Old) (6 channels) ---
+    # We keep this to preserve your original 32 structure,
+    # even though Eigenvalues (below) are better.
+    def get_hessian_diag(smoothed_vol):
         zz = sobel(sobel(smoothed_vol, axis=0), axis=0)
         yy = sobel(sobel(smoothed_vol, axis=1), axis=1)
         xx = sobel(sobel(smoothed_vol, axis=2), axis=2)
-        
-        zy = sobel(sobel(smoothed_vol, axis=0), axis=1)
-        zx = sobel(sobel(smoothed_vol, axis=0), axis=2)
-        yx = sobel(sobel(smoothed_vol, axis=1), axis=2)
-        
-        # We need to compute eigenvalues for each pixel. 
-        # This is slow in pure Python loop, so we use a simplified approximation 
-        # or just stack the raw Hessian components if speed is critical.
-        # Here, let's use a simplified determinant-like feature or just Trace?
-        # Actually, for standard RF features, just adding the diagonal (Laplacian) 
-        # and maybe the Determinant is common.
-        # But let's try to be more specific:
-        # Let's return Principal Curvatures approximation: k1, k2, k3
-        
-        # Optimized: just return xx, yy, zz (2nd derivatives) directly
-        # They align with axes but still give curvature info.
         return xx, yy, zz
 
-    # Scale 2.0 (Small structures)
-    hxx, hyy, hzz = get_hessian_eigenvalues(gaussians[2.0])
-    features.extend([hxx, hyy, hzz]) # Ch 24-26
-    
-    # Scale 4.0 (Medium structures)
-    hxx, hyy, hzz = get_hessian_eigenvalues(gaussians[4.0])
-    features.extend([hxx, hyy, hzz]) # Ch 27-29
+    hxx, hyy, hzz = get_hessian_diag(gaussians[2.0])
+    features.extend([hxx, hyy, hzz])
+    hxx, hyy, hzz = get_hessian_diag(gaussians[4.0])
+    features.extend([hxx, hyy, hzz])
 
-    # --- Group 6: Local Variance / StdDev (2 channels) ---
-    # Texture roughness
+    # --- Group 6: Local Variance (2 channels) ---
     def get_std(raw, smoothed, s):
-        # Var(X) = E[X^2] - (E[X])^2
-        # Sm(I^2) - Sm(I)^2
         mean_sq = gaussian_filter(raw**2, sigma=s)
-        mean = smoothed # already computed
+        mean = smoothed
         var = mean_sq - mean**2
         return np.sqrt(np.maximum(var, 0))
 
-    features.append(get_std(img, gaussians[2.0], 2.0)) # Ch 30
-    features.append(get_std(img, gaussians[4.0], 4.0)) # Ch 31
+    features.append(get_std(img, gaussians[2.0], 2.0))
+    features.append(get_std(img, gaussians[4.0], 4.0))
+
+    # =========================================================
+    # NEW FEATURES (8 Channels)
+    # =========================================================
+
+    # --- Group 7: Local Range / Texture (2 channels) ---
+    # Calculates Max - Min in a neighborhood.
+    # Great for distinguishing messy cytoplasm from smooth organelles.
+    def get_range(vol, size):
+        mx = maximum_filter(vol, size=size)
+        mn = minimum_filter(vol, size=size)
+        return mx - mn
+
+    features.append(get_range(img, size=3))  # Fine texture (Ch 32)
+    features.append(get_range(gaussians[1.0], size=5))  # Coarse texture (Ch 33)
+
+    # --- Group 8: True Hessian Eigenvalues (6 channels) ---
+    # Captures Shape: Sheet (Membrane) vs Tube vs Blob
+    def get_eigenvalues(vol, sigma):
+        # returns list [lambda1, lambda2, lambda3] per pixel
+        # This uses skimage, which is optimized
+        H_elems = hessian_matrix(vol, sigma=sigma, order="rc")
+        eigvals = hessian_matrix_eigvals(H_elems)
+        return eigvals  # list of 3 arrays
+
+    # Scale 2.0 (Organelle Boundaries)
+    eigs_s2 = get_eigenvalues(img, sigma=2.0)
+    features.extend(eigs_s2)  # Ch 34, 35, 36
+
+    # Scale 4.0 (Larger Context)
+    eigs_s4 = get_eigenvalues(img, sigma=4.0)
+    features.extend(eigs_s4)  # Ch 37, 38, 39
 
     # Stack
     stack = np.stack(features, axis=-1).astype(np.float32)
-    
-    # Safety Check: Ensure exactly 32 channels
-    if stack.shape[-1] != 32:
-        print(f"Warning: Generated {stack.shape[-1]} features instead of 32. Truncating or Padding.")
-        if stack.shape[-1] > 32:
-            stack = stack[..., :32]
-    
-    return stack
 
+    # Safety Check
+    if stack.shape[-1] != 40:
+        print(f"Warning: Features count is {stack.shape[-1]}, expected 40.")
+        if stack.shape[-1] > 40:
+            stack = stack[..., :40]
+
+    return stack
 
 # ============================================================
 # Step 2-4: Load multiple crops, align, and store (MODIFIED for s1)
@@ -243,19 +235,15 @@ for crop_id in CROP_IDS:
 
     # --- Step 4. Build multi-class label (s0 -> downsample -> s1) ---
     label_multi = np.zeros((Dz, Dy, Dx), dtype=np.uint8)
-
     for cname, real_id in SELECT_CLASSES.items():
         path = os.path.join(CROP_ROOT, cname, "s0")
         try:
             # Load s0 binary mask
             arr_s0 = zarr.open(path, mode="r")[:]
-
             # Downsample to s1: Slice every 2nd pixel [::2, ::2, ::2]
             arr_s1 = arr_s0[::SCALE_FACTOR, ::SCALE_FACTOR, ::SCALE_FACTOR]
-
             # Clip shape if mismatch (handle odd/even rounding issues)
             arr_s1 = arr_s1[:Dz, :Dy, :Dx]
-
             cid = CLASS_ID_MAP[cname]
             label_multi[arr_s1 > 0] = cid
         except Exception as e:
@@ -291,16 +279,15 @@ y_all_crops_list = []
 n_feats = 0  # Initialize feature count
 
 for crop_item in all_crops_data:
-    raw_crop = crop_item['raw']
-    label_multi = crop_item['label']
-
+    raw_crop = crop_item["raw"]
+    label_multi = crop_item["label"]
     print(f"  Extracting features for {crop_item['id']}...")
 
     # 1. Execute feature extraction on the current 3D volume
-    X_vol_4d = extract_full_3d_features_32ch(raw_crop)
+    X_vol_4d = extract_full_3d_features_40ch(raw_crop)
 
     # 💥 NEW: Store the 4D feature volume for fast visualization later (Step 9)
-    crop_item['features_4d'] = X_vol_4d
+    crop_item["features_4d"] = X_vol_4d
 
     # Get feature count only once
     if n_feats == 0:
@@ -310,16 +297,13 @@ for crop_item in all_crops_data:
     # 2. Flatten the feature volume and label volume
     X_pixels = X_vol_4d.reshape(-1, n_feats)
     y_pixels = label_multi.reshape(-1)
-
     X_all_crops_list.append(X_pixels)
     y_all_crops_list.append(y_pixels)
 
 # 3. Concatenate all flattened data into the final training/validation sets
 X_all_flat = np.concatenate(X_all_crops_list, axis=0)  # Total_Pixels x N_features
 y_all_flat = np.concatenate(y_all_crops_list, axis=0)  # Total_Pixels
-
 print(f"Total merged flat dataset size: {X_all_flat.shape[0]} pixels")
-
 
 # ============================================================
 # NEW: Function Definition for Pixel Sampling
@@ -332,32 +316,26 @@ def limit_class_pixels(X, y, max_per_class=50000, random_state=42):
     np.random.seed(random_state)
     X_list, y_list = [], []
     all_unique_classes = np.unique(y)
-
     print("\n===== Limiting class sizes =====")
 
     for c in all_unique_classes:
         idx = np.where(y == c)[0]
         count = len(idx)
-
         cname = "Background" if c == 0 else CLASS_NAMES_ORDERED[c - 1]
         print(f"Class {c} ({cname}): total {count} pixels")
-
         if count > max_per_class:
             selected = np.random.choice(idx, max_per_class, replace=False)
             print(f"   -> sampled {max_per_class}")
         else:
             selected = idx
             print(f"   -> kept all {count}")
-
         X_list.append(X[selected])
         y_list.append(y[selected])
 
     X_new = np.concatenate(X_list, axis=0)
     y_new = np.concatenate(y_list, axis=0)
-
     print(f"\nBalanced dataset size: {X_new.shape[0]} pixels")
     return X_new, y_new
-
 
 # ============================================================
 # Step 6: K-fold Cross Validation Setup (MODIFIED)
@@ -369,15 +347,15 @@ kf = KFold(n_splits=len(CROP_IDS), shuffle=True, random_state=42)
 # Calculate cumulative pixel count indices to slice X_all_flat and y_all_flat
 # This array tells us where each crop starts in the flattened dataset
 crop_start_indices = np.cumsum([0] + crop_pixel_counts)
-
 fold_scores = []
 
 # ============================================================
 # Step 7: Train & Validate (MODIFIED for Crop-based split & Chunking)
 # ============================================================
 
-for fold, (train_crop_idx, val_crop_idx) in tqdm(enumerate(kf.split(crop_indices)), total=kf.n_splits,
-                                                 desc="K-Fold Progress"):
+for fold, (train_crop_idx, val_crop_idx) in tqdm(
+    enumerate(kf.split(crop_indices)), total=kf.n_splits, desc="K-Fold Progress"
+):
     print(f"\n================ FOLD {fold} ================")
     fold_start = time.time()
 
@@ -388,7 +366,6 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(enumerate(kf.split(crop_indices
         end = crop_start_indices[c_idx + 1]
         X_train_list.append(X_all_flat[start:end])
         y_train_list.append(y_all_flat[start:end])
-
     X_train_full = np.concatenate(X_train_list, axis=0)
     y_train_full = np.concatenate(y_train_list, axis=0)
 
@@ -396,7 +373,6 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(enumerate(kf.split(crop_indices
     val_c_idx = val_crop_idx[0]
     start = crop_start_indices[val_c_idx]
     end = crop_start_indices[val_c_idx + 1]
-
     X_val = X_all_flat[start:end]
     y_val = y_all_flat[start:end]
     print(f"FOLD {fold}: Validation Crop ID: {CROP_IDS[val_c_idx]}")
@@ -406,31 +382,30 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(enumerate(kf.split(crop_indices
     # ------------------------------------------------------------
     # 假设使用 50000 像素作为测试限制
     PIXEL_LIMIT = 50000
-    print(f"FOLD {fold}: Applying pixel limit of {PIXEL_LIMIT} per class to training data...")
-    X_train, y_train = limit_class_pixels(
-        X_train_full,
-        y_train_full,
-        max_per_class=PIXEL_LIMIT,
-        random_state=42 + fold
+    print(
+        f"FOLD {fold}: Applying pixel limit of {PIXEL_LIMIT} per class to training data..."
     )
-
+    X_train, y_train = limit_class_pixels(
+        X_train_full, y_train_full, max_per_class=PIXEL_LIMIT, random_state=42 + fold
+    )
     print(f"Fold {fold} Sampled Train set shape:", X_train.shape)
-    print(f"Fold {fold} Val set shape:  ", X_val.shape)
+    print(f"Fold {fold} Val set shape:  ", X_val.shape)
 
     # ============================================================
     # Step C: Train RandomForest 🌳
     # ============================================================
     print("Training RandomForest...")
-    clf = RandomForestClassifier(n_estimators=100, class_weight="balanced", n_jobs=2, random_state=42)
+    clf = RandomForestClassifier(
+        n_estimators=100, class_weight="balanced", n_jobs=2, random_state=42
+    )
     clf.fit(X_train, y_train)
 
     # ============================================================
     # Step D & E: Predict & Evaluate (USING CHUNKING)
     # ============================================================
     print("Predicting...")
-
-    # --- NEW: Predict in Chunks to avoid OOM ---
-    chunk_size = 8000000  # 800万像素点一个批次
+    # --- Predict in Chunks ---
+    chunk_size = 8000000
     y_pred_list = []
     n_pixels = X_val.shape[0]
     n_chunks = int(np.ceil(n_pixels / chunk_size))
@@ -438,38 +413,57 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(enumerate(kf.split(crop_indices
     for i in tqdm(range(n_chunks), desc="Predicting Chunks"):
         start_idx = i * chunk_size
         end_idx = min((i + 1) * chunk_size, n_pixels)
-
         X_chunk = X_val[start_idx:end_idx]
-
-        # 使用训练好的模型对小块进行预测
         y_pred_chunk = clf.predict(X_chunk)
         y_pred_list.append(y_pred_chunk)
+    y_pred_flat = np.concatenate(y_pred_list, axis=0)
 
-    # 将所有小块的预测结果拼接回完整的预测结果
-    y_pred = np.concatenate(y_pred_list, axis=0)
-    print(f"Prediction complete. Final shape: {y_pred.shape}")
-    # ------------------------------------------------------------
+    # 1. Reshape back to 3D for Post-Processing
+    # We need the validation crop shape.
+    # Note: In your loop, Val Set is a single crop, so we can get its shape easily.
+    # We stored 'shape' in all_crops_data. Let's retrieve it.
+    val_crop_data = all_crops_data[val_c_idx]
+    Dz_val, Dy_val, Dx_val = val_crop_data["shape"]
+    y_pred_3d = y_pred_flat.reshape(Dz_val, Dy_val, Dx_val)
 
-    # Calculate scores PER CLASS for the 5 target classes
-    iou_per_class = jaccard_score(y_val, y_pred, average=None, labels=labels_eval, zero_division=0)
-    dice_per_class = f1_score(y_val, y_pred, average=None, labels=labels_eval, zero_division=0)
+    # ============================================================
+    # 🌟 NEW: POST-PROCESSING (Morphological Cleaning)
+    # ============================================================
+    print("Applying Post-processing (Median Filter)...")
+    # Median Filter: Replaces each pixel with the median of its neighbors (3x3x3).
+    # effectively removes salt-and-pepper noise and smooths boundaries.
+    y_pred_3d_refined = median_filter(y_pred_3d, size=3)
+    # Optional: If you have very specific noise, you can increase size to 5,
+    # but size=3 is usually safest for thin membranes.
 
+    # Flatten back for metric calculation
+    y_pred_final = y_pred_3d_refined.reshape(-1)
+
+    # ============================================================
+    print(f"Prediction complete. Final shape: {y_pred_final.shape}")
+
+    # Calculate scores (Using y_pred_final instead of raw prediction)
+    iou_per_class = jaccard_score(
+        y_val, y_pred_final, average=None, labels=labels_eval, zero_division=0
+    )
+    dice_per_class = f1_score(
+        y_val, y_pred_final, average=None, labels=labels_eval, zero_division=0
+    )
     iou_macro = np.mean(iou_per_class)
     dice_macro = np.mean(dice_per_class)
-
     print(f"FOLD {fold} Result: IoU_macro={iou_macro:.4f}, Dice_macro={dice_macro:.4f}")
 
     # Store results
-    fold_scores.append({
-        'iou_macro': iou_macro,
-        'dice_macro': dice_macro,
-        'iou_per_class': iou_per_class,
-        'dice_per_class': dice_per_class
-    })
-
+    fold_scores.append(
+        {
+            "iou_macro": iou_macro,
+            "dice_macro": dice_macro,
+            "iou_per_class": iou_per_class,
+            "dice_per_class": dice_per_class,
+        }
+    )
     elapsed = time.time() - fold_start
     print(f"⏱ Fold {fold} took {elapsed / 60:.2f} minutes")
-
 
 # ============================================================
 # Step 7.5: Train final model on ALL data (Balanced Sampling) (MINOR MODIFICATION)
@@ -490,7 +484,6 @@ final_clf = RandomForestClassifier(
 )
 
 final_clf.fit(X_sub, y_sub)
-
 print("🎉 Final model training complete!")
 
 # ============================================================
@@ -499,8 +492,8 @@ print("🎉 Final model training complete!")
 print("\n================ Final K-fold Results ================\n")
 
 # Aggregate per-class scores across all folds
-all_iou_per_class = np.array([s['iou_per_class'] for s in fold_scores])
-all_dice_per_class = np.array([s['dice_per_class'] for s in fold_scores])
+all_iou_per_class = np.array([s["iou_per_class"] for s in fold_scores])
+all_dice_per_class = np.array([s["dice_per_class"] for s in fold_scores])
 
 # Calculate average per-class scores
 avg_iou_per_class = np.mean(all_iou_per_class, axis=0)
@@ -508,7 +501,9 @@ avg_dice_per_class = np.mean(all_dice_per_class, axis=0)
 
 # Print detailed results per fold
 for k, scores in enumerate(fold_scores):
-    print(f"Fold {k}:   IoU_macro={scores['iou_macro']:.4f}   Dice_macro={scores['dice_macro']:.4f}")
+    print(
+        f"Fold {k}:   IoU_macro={scores['iou_macro']:.4f}   Dice_macro={scores['dice_macro']:.4f}"
+    )
 
 print("\n---------------- Detailed Class Averages ----------------")
 print("Class | Avg IoU (Jaccard) | Avg Dice (F1)")
@@ -535,7 +530,7 @@ existing_dirs = [d for d in os.listdir(result_root) if d.startswith("predict")]
 max_i = 0
 for d in existing_dirs:
     try:
-        num_str = ''.join(filter(str.isdigit, d))
+        num_str = "".join(filter(str.isdigit, d))
         if num_str:
             max_i = max(max_i, int(num_str))
     except:
@@ -554,44 +549,58 @@ cmap = plt.get_cmap("tab10")
 CLASS_NAMES = ["bg", "cyto", "mito_mem", "mito_lum", "er_mem", "er_lum"]
 # Original ID mapping for display
 SELECT_CLASSES_MAP = {
-    "cyto": 35, "mito_mem": 3, "mito_lum": 4, "er_mem": 16, "er_lum": 17
+    "cyto": 35,
+    "mito_mem": 3,
+    "mito_lum": 4,
+    "er_mem": 16,
+    "er_lum": 17,
 }
 
 legend_items = []
 for idx, name in enumerate(CLASS_NAMES):
     real_id = 0 if name == "bg" else SELECT_CLASSES_MAP[name]
-    legend_items.append({
-        "model_idx": idx,
-        "real_id": real_id,
-        "label": f"{name} ({real_id})",
-        "color": cmap(idx)
-    })
+    legend_items.append(
+        {
+            "model_idx": idx,
+            "real_id": real_id,
+            "label": f"{name} ({real_id})",
+            "color": cmap(idx),
+        }
+    )
 
 # Sort legend items by Real ID for a professional look
 legend_items.sort(key=lambda x: x["real_id"])
 legend_patches = [
-    mpatches.Patch(color=item["color"], label=item["label"]) 
+    plt.Line2D(
+        [0],
+        [0],
+        color=item["color"],
+        lw=4,
+        label=item["label"],
+        marker="s",
+        linestyle="None",
+        markersize=10,
+    )
     for item in legend_items
 ]
 
 # ---- 3. Iterate through all crops and save slices ----
 num_vis_per_crop = 10
-crops_data_dict = {item['id']: item for item in all_crops_data}
+crops_data_dict = {item["id"]: item for item in all_crops_data}
 
-if 'final_clf' not in locals():
+if "final_clf" not in locals():
     print("Warning: final_clf not found. Skipping visualization.")
 else:
     for crop_id in CROP_IDS:
         crop_item = crops_data_dict[crop_id]
         crop_save_folder = os.path.join(experiment_folder, crop_id)
         os.makedirs(crop_save_folder, exist_ok=True)
-
         print(f"\n--- Processing {crop_id} (Saving {num_vis_per_crop} slices) ---")
 
-        raw_crop_vis = crop_item['raw']
-        label_multi_vis = crop_item['label']
-        Dz, Dy, Dx = crop_item['shape']
-        feat_vol_4d = crop_item['features_4d']
+        raw_crop_vis = crop_item["raw"]
+        label_multi_vis = crop_item["label"]
+        Dz, Dy, Dx = crop_item["shape"]
+        feat_vol_4d = crop_item["features_4d"]
 
         # Select random Z slices
         if Dz < num_vis_per_crop:
@@ -605,18 +614,24 @@ else:
             X_vis = feat_vis_slice.reshape(-1, n_feats)
             y_pred_vis = final_clf.predict(X_vis).reshape(Dy, Dx)
 
+            # Apply the same post-processing to the visualization to match your metrics
+            y_pred_vis = median_filter(y_pred_vis, size=3)
+            # --------------------------------------
+
             y_gt_vis = label_multi_vis[vis_z]
             raw_vis = raw_crop_vis[vis_z]
 
             # ---- Start Visualization ----
             # Increase figure size to accommodate the legend on the right
             fig = plt.figure(figsize=(20, 6))
-            plt.suptitle(f"Exp: {next_i} | Crop: {crop_id}, Slice z={vis_z}", fontsize=16)
+            plt.suptitle(
+                f"Exp: {next_i} | Crop: {crop_id}, Slice z={vis_z}", fontsize=16
+            )
 
             # --- 1. Raw ---
             plt.subplot(1, 3, 1)
             plt.title("Raw")
-            plt.imshow(raw_vis, cmap='gray')
+            plt.imshow(raw_vis, cmap="gray")
             plt.axis("off")
 
             # --- 2. Ground Truth (GT) ---
@@ -624,13 +639,14 @@ else:
             plt.title("Ground Truth")
             plt.imshow(y_gt_vis, cmap=cmap, vmin=0, vmax=9)
             plt.axis("off")
+
             # Add Legend to the right of GT
             plt.legend(
-                handles=legend_patches, 
-                bbox_to_anchor=(1.05, 1), 
-                loc='upper left', 
+                handles=legend_patches,
+                bbox_to_anchor=(1.05, 1),
+                loc="upper left",
                 title="Classes (ID)",
-                borderaxespad=0.
+                borderaxespad=0.0,
             )
 
             # --- 3. Prediction ---
@@ -638,22 +654,23 @@ else:
             plt.title("Prediction")
             plt.imshow(y_pred_vis, cmap=cmap, vmin=0, vmax=9)
             plt.axis("off")
+
             # Add Legend to the right of Prediction
             plt.legend(
-                handles=legend_patches, 
-                bbox_to_anchor=(1.05, 1), 
-                loc='upper left', 
+                handles=legend_patches,
+                bbox_to_anchor=(1.05, 1),
+                loc="upper left",
                 title="Classes (ID)",
-                borderaxespad=0.
+                borderaxespad=0.0,
             )
 
             plt.tight_layout(rect=[0, 0, 1, 0.94])
-
             # Save image
-            save_path = os.path.join(crop_save_folder, f"slice_{i + 1:02d}_z{vis_z:04d}.png")
+            save_path = os.path.join(
+                crop_save_folder, f"slice_{i + 1:02d}_z{vis_z:04d}.png"
+            )
             plt.savefig(save_path, dpi=200)
             plt.close()
-
             print(f"  [{i + 1}/{len(vis_zs)}] Saved: {save_path}")
 
     print("\n--- Script Finished ---")

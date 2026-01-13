@@ -12,7 +12,7 @@ import random
 import numpy as np
 import zarr  # type: ignore
 from tqdm import tqdm  # type: ignore
-from scipy.ndimage import gaussian_filter, sobel  # type: ignore
+from scipy.ndimage import gaussian_filter, sobel, label  # type: ignore
 from sklearn.model_selection import KFold  # type: ignore
 import torch
 import torch.nn as nn
@@ -20,6 +20,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt  # type: ignore
 import matplotlib.patches as mpatches
+
+
 
 
 # -----------------------------
@@ -69,7 +71,7 @@ NUM_CLASSES = 6  # 0..5
 
 # === NEW: CLASS WEIGHTS to address Dice=0 issues ===
 # Weights: [bg, cyto, mito_mem, mito_lum, er_mem, er_lum]
-CLASS_WEIGHTS_LIST = [1.0, 1.0, 10.0, 10.0, 5.0, 5.0]
+CLASS_WEIGHTS_LIST = [3.0, 1.0, 10.0, 10.0, 5.0, 5.0]
 # ===================================================
 
 REF_CLASS = "nucpl"
@@ -86,7 +88,7 @@ PATCHES_PER_EPOCH = 300  # per fold
 VAL_PATCHES = 80
 
 # Sliding-window inference for full volume evaluation
-INFER_STRIDE = (16, 64, 64)  # overlap = patch - stride
+INFER_STRIDE = (4, 32, 32)  # overlap = patch - stride
 
 # Output
 N_VAL_SLICES = 10
@@ -134,7 +136,7 @@ def load_one_crop(crop_id: str, raw_zarr) -> dict:
     Assumes s1 is 2x downsampled compared to s0.
     """
     scale_factor = 2  # s1 is s0 / 2
-
+    
     crop_root = os.path.join(GROUNDTRUTH_ROOT, crop_id)
     ref_s0 = os.path.join(crop_root, REF_CLASS, "s0")
     ref_zattr = os.path.join(crop_root, REF_CLASS, ".zattrs")
@@ -155,41 +157,42 @@ def load_one_crop(crop_id: str, raw_zarr) -> dict:
     vz0_s0 = int(tz / scale_z)
     vy0_s0 = int(ty / scale_y)
     vx0_s0 = int(tx / scale_x)
-
+    
     # 3. Convert to s1 indices (Divide by scale_factor)
     vz0 = vz0_s0 // scale_factor
     vy0 = vy0_s0 // scale_factor
     vx0 = vx0_s0 // scale_factor
-
+    
     # Calculate s1 shape
     Dz = Dz_s0 // scale_factor
     Dy = Dy_s0 // scale_factor
     Dx = Dx_s0 // scale_factor
-
+    
     vz1, vy1, vx1 = vz0 + Dz, vy0 + Dy, vx0 + Dx
 
     # 4. Load Raw (from s1 path)
     raw_crop = raw_zarr[vz0:vz1, vy0:vy1, vx0:vx1]
+    raw_crop = gaussian_filter(raw_crop.astype(np.float32), sigma=0.5).astype(np.uint8)
 
     # 5. Build multi-class label (Load s0, then downsample to s1)
     label_multi = np.zeros((Dz, Dy, Dx), dtype=np.uint8)
-
+    
     for cname in SELECT_CLASSES.keys():
         path = os.path.join(crop_root, cname, "s0")
         try:
             # Load s0 mask
-            arr_s0 = zarr.open(path, mode="r")[:]
-
+            arr_s0 = zarr.open(path, mode="r")[:] 
+            
             # Downsample to match s1 (Simple slicing [::2])
             # CAUTION: Ensure the sliced shape matches label_multi shape
             arr_s1 = arr_s0[::scale_factor, ::scale_factor, ::scale_factor]
-
+            
             # Crop to match exact dimensions if rounding errors occur
             arr_s1 = arr_s1[:Dz, :Dy, :Dx]
-
+            
             cid = CLASS_ID_MAP[cname]
             label_multi[arr_s1 > 0] = cid
-
+            
         except Exception as e:
             print(f"Warning: failed load class {cname} in {crop_id}: {e}")
 
@@ -203,13 +206,7 @@ def load_one_crop(crop_id: str, raw_zarr) -> dict:
         raw_crop = raw_crop[:mz, :my, :mx]
         label_multi = label_multi[:mz, :my, :mx]
 
-    return {
-        "raw": raw_crop,
-        "label": label_multi,
-        "shape": raw_crop.shape,
-        "id": crop_id,
-    }
-
+    return {"raw": raw_crop, "label": label_multi, "shape": raw_crop.shape, "id": crop_id}
 
 # -----------------------------
 # Patch sampler dataset
@@ -250,15 +247,11 @@ class RandomPatchDataset(Dataset):
         # -------------------
         current_pz = raw_patch.shape[0]
         if current_pz != self.pz:
-            print(
-                f"Warning: Patch size mismatch (Z={current_pz} != {self.pz}). Resampling..."
-            )
-            return self.__getitem__(np.random.randint(0, self.n_patches))
-
+             print(f"Warning: Patch size mismatch (Z={current_pz} != {self.pz}). Resampling...")
+             return self.__getitem__(np.random.randint(0, self.n_patches)) 
+             
         # Optional: ensure Y and X are also correct
-        assert (
-            raw_patch.shape[1] == self.py and raw_patch.shape[2] == self.px
-        ), "Y or X dimension mismatch after slicing."
+        assert raw_patch.shape[1] == self.py and raw_patch.shape[2] == self.px, "Y or X dimension mismatch after slicing."
         # -------------------
 
         x_patch = make_cnn_input(raw_patch)  # (C,Z,Y,X)
@@ -389,6 +382,24 @@ def dice_per_class(pred, gt, num_classes=6, eps=1e-6):
     return out
 
 
+def remove_small_components(seg, min_voxels=2000):
+    """
+    seg: (Z,Y,X) uint8 segmentation
+    Remove small isolated components for each foreground class.
+    """
+    out = seg.copy()
+
+    for c in range(1, NUM_CLASSES):  # skip background
+        mask = seg == c
+        lab, n = label(mask)
+
+        for i in range(1, n + 1):
+            if (lab == i).sum() < min_voxels:
+                out[lab == i] = 0  # assign to background
+
+    return out
+
+
 # -----------------------------
 # High-Quality Sliding-window inference (Gaussian + Mirror Padding)
 # -----------------------------
@@ -397,12 +408,10 @@ def _get_gaussian(patch_size, sigma_scale=1.0 / 8):
     center_coords = [i // 2 for i in patch_size]
     sigmas = [i * sigma_scale for i in patch_size]
     tmp[tuple(center_coords)] = 1
-    gaussian_importance_map = gaussian_filter(tmp, sigmas, 0, mode="constant", cval=0)
-
+    gaussian_importance_map = gaussian_filter(tmp, sigmas, 0, mode='constant', cval=0)
+    
     # Normalize
-    gaussian_importance_map = (
-        gaussian_importance_map / np.max(gaussian_importance_map) * 1
-    )
+    gaussian_importance_map = gaussian_importance_map / np.max(gaussian_importance_map) * 1
     gaussian_importance_map = gaussian_importance_map.astype(np.float32)
 
     # Gaussian cannot be 0, otherwise division by zero errors
@@ -411,82 +420,97 @@ def _get_gaussian(patch_size, sigma_scale=1.0 / 8):
     )
     return gaussian_importance_map
 
-
 @torch.no_grad()
 def sliding_window_predict(
     model, raw_zyx: np.ndarray, patch_zyx=(32, 128, 128), stride_zyx=(16, 64, 64)
 ):
     """
-    SOTA Inference with Gaussian Blending and Mirror Padding.
-    Eliminates edge artifacts.
+    SOTA Inference: Gaussian Blending + Mirror Padding + TTA (Test Time Augmentation).
+    TTA (4x) drastically reduces edge artifacts and random noise spots.
     """
     model.eval()
-
-    # 1. Pad the input volume to handle edges
-    # We pad by half the patch size to ensure edge pixels can be in the center of a patch
+    
+    # 1. Pad input (Mirror padding)
     pz, py, px = patch_zyx
     pad_z, pad_y, pad_x = pz // 2, py // 2, px // 2
-
-    # Use 'reflect' to avoid sharp zero-boundaries that confuse InstanceNorm
+    
     raw_padded = np.pad(
-        raw_zyx, ((pad_z, pad_z), (pad_y, pad_y), (pad_x, pad_x)), mode="reflect"
+        raw_zyx, 
+        ((pad_z, pad_z), (pad_y, pad_y), (pad_x, pad_x)), 
+        mode='reflect'
     )
+    
     Dz_pad, Dy_pad, Dx_pad = raw_padded.shape
     sz, sy, sx = stride_zyx
 
-    # 2. Prepare result arrays
+    # 2. Prepare accumulators
+    # We accumulate logits (float) before argmax
     scores = np.zeros((NUM_CLASSES, Dz_pad, Dy_pad, Dx_pad), dtype=np.float32)
-    # Instead of counting '1', we accumulate the gaussian weights
     gaussian_weights = np.zeros((Dz_pad, Dy_pad, Dx_pad), dtype=np.float32)
 
-    # 3. Get Gaussian window
-    # This window gives high weight to center, low weight to edges
+    # 3. Gaussian Window
     g_window = _get_gaussian(patch_zyx)
-    g_window_torch = torch.from_numpy(g_window).to(DEVICE)  # (Z,Y,X)
+    g_window_torch = torch.from_numpy(g_window).to(DEVICE)
 
-    # 4. Sliding locations
+    # 4. Define TTA transforms (Flip axes)
+    # [] = Original, [2] = Flip Z, [3] = Flip Y, [4] = Flip X
+    # Note: Input tensor is (B, C, Z, Y, X), so dims are 2,3,4
+    tta_dims = [[], [2], [3], [4]] 
+    
+    # 5. Coordinates
     z_starts = list(range(0, max(Dz_pad - pz, 0) + 1, sz))
     y_starts = list(range(0, max(Dy_pad - py, 0) + 1, sy))
     x_starts = list(range(0, max(Dx_pad - px, 0) + 1, sx))
+    
+    if z_starts[-1] != Dz_pad - pz: z_starts.append(Dz_pad - pz)
+    if y_starts[-1] != Dy_pad - py: y_starts.append(Dy_pad - py)
+    if x_starts[-1] != Dx_pad - px: x_starts.append(Dx_pad - px)
 
-    # Ensure we cover the last bit
-    if z_starts[-1] != Dz_pad - pz:
-        z_starts.append(Dz_pad - pz)
-    if y_starts[-1] != Dy_pad - py:
-        y_starts.append(Dy_pad - py)
-    if x_starts[-1] != Dx_pad - px:
-        x_starts.append(Dx_pad - px)
-
-    # 5. Inference Loop
-    for z0 in tqdm(z_starts, desc="Infer (Gaussian)"):
+    # 6. Main Loop
+    for z0 in tqdm(z_starts, desc="Infer (TTA+Gaussian)"):
         for y0 in y_starts:
             for x0 in x_starts:
-                # Extract patch
                 patch_raw = raw_padded[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
-                # Check shape (sanity check)
-                if patch_raw.shape != (pz, py, px):
-                    continue
-                x_patch = make_cnn_input(patch_raw)  # (C,Z,Y,X)
-                x = torch.from_numpy(x_patch).unsqueeze(0).to(DEVICE)  # (1,C,Z,Y,X)
-                logits = model(x)
-                prob = torch.softmax(logits, dim=1).squeeze(0)  # (K,Z,Y,X)
+                
+                if patch_raw.shape != (pz, py, px): continue
 
-                # --- The Magic: Multiply by Gaussian Window ---
-                prob *= g_window_torch
-                # Accumulate
-                prob_np = prob.cpu().numpy()
-                scores[:, z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += prob_np
-                gaussian_weights[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += g_window
+                # Prepare Base Input
+                x_in_np = make_cnn_input(patch_raw) # (C, Z, Y, X)
+                x_in = torch.from_numpy(x_in_np).unsqueeze(0).to(DEVICE) # (1, C, Z, Y, X)
+                
+                # --- TTA Loop (Average 4 predictions) ---
+                patch_prob_sum = torch.zeros((NUM_CLASSES, pz, py, px), device=DEVICE)
+                
+                for dims in tta_dims:
+                    if len(dims) == 0:
+                        # Original
+                        logits = model(x_in)
+                    else:
+                        # Flip input -> Predict -> Flip output back
+                        x_flipped = torch.flip(x_in, dims=dims)
+                        logits_flipped = model(x_flipped)
+                        logits = torch.flip(logits_flipped, dims=dims)
+                    
+                    prob = torch.softmax(logits, dim=1).squeeze(0) # (K, Z, Y, X)
+                    patch_prob_sum += prob
+                
+                # Average probabilities
+                avg_prob = patch_prob_sum / len(tta_dims)
 
-    # 6. Normalize and Crop back
-    # Avoid division by zero
+                # Gaussian Weighting
+                avg_prob *= g_window_torch
+                
+                # Accumulate to global volume
+                scores[:, z0:z0+pz, y0:y0+py, x0:x0+px] += avg_prob.cpu().numpy()
+                gaussian_weights[z0:z0+pz, y0:y0+py, x0:x0+px] += g_window
+
+    # 7. Normalize & Crop
     gaussian_weights = np.maximum(gaussian_weights, 1e-6)
     scores /= gaussian_weights[None, ...]
-    # Crop back to original size
+    
     scores = scores[:, pad_z:-pad_z, pad_y:-pad_y, pad_x:-pad_x]
-    pred = np.argmax(scores, axis=0).astype(np.uint8)
-
-    return pred
+    
+    return np.argmax(scores, axis=0).astype(np.uint8)
 
 
 # -----------------------------
@@ -508,7 +532,9 @@ def train_one_fold(fold_id, train_crops, val_crops):
     train_ds = RandomPatchDataset(
         train_crops, n_patches=PATCHES_PER_EPOCH, patch_zyx=PATCH_ZYX
     )
-    val_ds = RandomPatchDataset(val_crops, n_patches=VAL_PATCHES, patch_zyx=PATCH_ZYX)
+    val_ds = RandomPatchDataset(
+        val_crops, n_patches=VAL_PATCHES, patch_zyx=PATCH_ZYX
+    )
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True
@@ -517,8 +543,8 @@ def train_one_fold(fold_id, train_crops, val_crops):
         val_ds, batch_size=1, shuffle=False, num_workers=1, pin_memory=True
     )
 
-    SAVE_EVERY = 100  # epochs
-    best_val = 1e9  # large
+    SAVE_EVERY = 300
+    best_val = 1e9
     best_path = os.path.join(run_dir, "best.pt")
 
     # ===========================
@@ -612,6 +638,7 @@ def train_one_fold(fold_id, train_crops, val_crops):
         patch_zyx=PATCH_ZYX,
         stride_zyx=INFER_STRIDE,
     )
+    pred = remove_small_components(pred, min_voxels=2000)
 
     gt = val_crop["label"]
 
@@ -626,99 +653,67 @@ def train_one_fold(fold_id, train_crops, val_crops):
     for ci, d in enumerate(dices):
         print(f"  {ci}:{CLASS_NAMES[ci]}  Dice={d:.4f}")
 
-    # ===========================================================
-    # Save slice visualizations (Sorted Legend by Real ID)
-    # ===========================================================
+    # ===========================
+    # save slice visualizations
+    # ===========================
     vis_dir = os.path.join(run_dir, "vis")
     os.makedirs(vis_dir, exist_ok=True)
 
     Dz = val_crop["raw"].shape[0]
     zs = np.linspace(0, Dz - 1, N_VAL_SLICES, dtype=int)
 
-    # 1. Prepare Legend Data
-    # Use tab10 colormap (must match the order in CLASS_NAMES)
+    # 1. Setup Colormap and Legend Patches
+    # Since your labels are already 0..5, we map them directly to tab10 colors
     cmap = plt.get_cmap("tab10")
+    
+    legend_patches = []
+    for i, name in enumerate(CLASS_NAMES):
+        # i is 0..5, matches the pixel value in GT/Pred
+        legend_patches.append(mpatches.Patch(color=cmap(i), label=f"{name} ({i})"))
 
-    # Your original class to ID mapping
-    SELECT_CLASSES = {
-        "cyto": 35,
-        "mito_mem": 3,
-        "mito_lum": 4,
-        "er_mem": 16,
-        "er_lum": 17,
-    }
-
-    # Internal model class names (order corresponds to indices 0-5 in 'pred')
-    CLASS_NAMES = ["bg", "cyto", "mito_mem", "mito_lum", "er_mem", "er_lum"]
-
-    # Build a list of legend entries
-    legend_items = []
-    for model_idx, name in enumerate(CLASS_NAMES):
-        # Assign color based on internal model index (0-5)
-        color = cmap(model_idx)
-
-        # Retrieve the real dataset ID
-        if name == "bg":
-            real_id = 0
-        else:
-            real_id = SELECT_CLASSES[name]
-
-        legend_items.append(
-            {"real_id": real_id, "color": color, "label": f"{name} ({real_id})"}
-        )
-
-    # 2. Key Step: Sort legend entries by Real ID (0, 3, 4, 16, 17, 35)
-    legend_items.sort(key=lambda x: x["real_id"])
-
-    # 3. Create Matplotlib patch objects for the legend
-    legend_patches = [
-        mpatches.Patch(color=item["color"], label=item["label"])
-        for item in legend_items
-    ]
-
-    # 4. Loop through slices and save plots
     for z in zs:
-        # Increase figure size to fit legends outside the plots
+        # Increase figure width to make room for legend
         fig = plt.figure(figsize=(20, 6))
 
-        # --- Subplot 1: Raw Image ---
+        # --- Raw ---
         plt.subplot(1, 3, 1)
         plt.title("Raw")
         plt.imshow(val_crop["raw"][z], cmap="gray")
         plt.axis("off")
 
-        # --- Subplot 2: Ground Truth (GT) ---
+        # --- GT ---
         plt.subplot(1, 3, 2)
         plt.title("GT")
-        # Ensure vmin/vmax covers our 0-5 internal index range
         plt.imshow(val_crop["label"][z], cmap=cmap, vmin=0, vmax=9)
         plt.axis("off")
-        # Add legend to the right of GT
+        # Add Legend
         plt.legend(
             handles=legend_patches,
             bbox_to_anchor=(1.05, 1),
-            loc="upper left",
-            borderaxespad=0.0,
-            title="Classes (ID)",
+            loc='upper left',
+            borderaxespad=0.,
+            title="Classes"
         )
 
-        # --- Subplot 3: Prediction (Pred) ---
+        # --- Pred ---
         plt.subplot(1, 3, 3)
         plt.title("Pred")
         plt.imshow(pred[z], cmap=cmap, vmin=0, vmax=9)
         plt.axis("off")
-        # Add legend to the right of Pred
+        # Add Legend
         plt.legend(
             handles=legend_patches,
             bbox_to_anchor=(1.05, 1),
-            loc="upper left",
-            borderaxespad=0.0,
-            title="Classes (ID)",
+            loc='upper left',
+            borderaxespad=0.,
+            title="Classes"
         )
 
         plt.tight_layout()
-        output_path = os.path.join(vis_dir, f"val_{val_crop['id']}_z{z:04d}.png")
-        plt.savefig(output_path, dpi=200)
+        outp = os.path.join(
+            vis_dir, f"val_{val_crop['id']}_z{z:04d}.png"
+        )
+        plt.savefig(outp, dpi=200)
         plt.close(fig)
 
     return best_val, dices
@@ -743,7 +738,7 @@ def main():
     train_idx = [i for i in range(len(all_crops)) if i != val_idx]
 
     train_crops = [all_crops[i] for i in train_idx]
-    val_crops = [all_crops[val_idx]]
+    val_crops   = [all_crops[val_idx]]
 
     print("\n" + "=" * 60)
     print(
