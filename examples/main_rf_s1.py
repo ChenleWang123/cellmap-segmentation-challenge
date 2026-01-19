@@ -33,8 +33,19 @@ from skimage.feature import (
 # ---------------------------------------------
 
 # Define all Crop IDs to be used in the K-Fold cross-validation (5 crops for 5-fold)
-CROP_IDS = ["crop292", "crop234", "crop236", "crop237", "crop239"]
-# If you need 7-fold: CROP_IDS = ["crop292", "crop234", "crop236", "crop237", "crop239", "crop243", "crop247"]
+# KFold(n_splits=len(CROP_IDS)) will automatically set it to 9 folds.
+# Each fold: 8 for training, 1 for validation.
+CROP_IDS = [
+    "crop234",
+    "crop236",
+    "crop237",
+    "crop239",
+    "crop248",
+    "crop252",
+    "crop254",
+    "crop256",
+    "crop292",
+]
 
 RAW_S0 = r"../data/jrc_cos7-1a/jrc_cos7-1a.zarr/recon-1/em/fibsem-uint8/s1"
 GROUNDTRUTH_ROOT = r"../data/jrc_cos7-1a/jrc_cos7-1a.zarr/recon-1/labels/groundtruth"
@@ -69,6 +80,7 @@ print("Raw shape:", raw_zarr.shape)
 # ============================================================
 # NEW: Function Definition for 3D Feature Extraction (Step 5 logic)
 # ============================================================
+
 
 def extract_full_3d_features_40ch(vol_3d):
     """
@@ -154,7 +166,8 @@ def extract_full_3d_features_40ch(vol_3d):
     def get_eigenvalues(vol, sigma):
         # returns list [lambda1, lambda2, lambda3] per pixel
         # This uses skimage, which is optimized
-        H_elems = hessian_matrix(vol, sigma=sigma, order="rc")
+        # H_elems = hessian_matrix(vol, sigma=sigma, order="rc")
+        H_elems = hessian_matrix(vol, sigma=sigma, order="rc", use_gaussian_derivatives=False)
         eigvals = hessian_matrix_eigvals(H_elems)
         return eigvals  # list of 3 arrays
 
@@ -176,6 +189,7 @@ def extract_full_3d_features_40ch(vol_3d):
             stack = stack[..., :40]
 
     return stack
+
 
 # ============================================================
 # Step 2-4: Load multiple crops, align, and store (MODIFIED for s1)
@@ -270,44 +284,22 @@ for crop_id in CROP_IDS:
     crop_pixel_counts.append(Dz * Dy * Dx)
 
 # ============================================================
-# Step 5: Full 3D Feature Extraction and Merging (MODIFIED)
+# Step 5: (LIGHT) Determine feature count only (NO global merge!)
 # ============================================================
-print("\n===== Performing Feature Extraction and Merging =====")
+print("\n===== Step 5: Determining Feature Count (No Global Merge) =====")
 
-X_all_crops_list = []
-y_all_crops_list = []
-n_feats = 0  # Initialize feature count
+# Just compute n_feats once using the first crop
+tmp_raw = all_crops_data[0]["raw"]
+tmp_feat = extract_full_3d_features_40ch(tmp_raw)
+n_feats = tmp_feat.shape[-1]
+del tmp_feat
+print(f"Total features per voxel: {n_feats}")
 
-for crop_item in all_crops_data:
-    raw_crop = crop_item["raw"]
-    label_multi = crop_item["label"]
-    print(f"  Extracting features for {crop_item['id']}...")
-
-    # 1. Execute feature extraction on the current 3D volume
-    X_vol_4d = extract_full_3d_features_40ch(raw_crop)
-
-    # 💥 NEW: Store the 4D feature volume for fast visualization later (Step 9)
-    crop_item["features_4d"] = X_vol_4d
-
-    # Get feature count only once
-    if n_feats == 0:
-        n_feats = X_vol_4d.shape[-1]
-        print(f"Total features per voxel: {n_feats}")
-
-    # 2. Flatten the feature volume and label volume
-    X_pixels = X_vol_4d.reshape(-1, n_feats)
-    y_pixels = label_multi.reshape(-1)
-    X_all_crops_list.append(X_pixels)
-    y_all_crops_list.append(y_pixels)
-
-# 3. Concatenate all flattened data into the final training/validation sets
-X_all_flat = np.concatenate(X_all_crops_list, axis=0)  # Total_Pixels x N_features
-y_all_flat = np.concatenate(y_all_crops_list, axis=0)  # Total_Pixels
-print(f"Total merged flat dataset size: {X_all_flat.shape[0]} pixels")
 
 # ============================================================
 # NEW: Function Definition for Pixel Sampling
 # ============================================================
+
 
 def limit_class_pixels(X, y, max_per_class=50000, random_state=42):
     """
@@ -337,6 +329,24 @@ def limit_class_pixels(X, y, max_per_class=50000, random_state=42):
     print(f"\nBalanced dataset size: {X_new.shape[0]} pixels")
     return X_new, y_new
 
+def sample_from_crop(X_flat, y_flat, max_per_class=50000, random_state=42):
+    """
+    Sample up to max_per_class pixels PER CLASS from ONE crop.
+    Returns a much smaller (X_s, y_s) to append into the fold training set.
+    """
+    rng = np.random.RandomState(random_state)
+    X_list, y_list = [], []
+
+    for c in np.unique(y_flat):
+        idx = np.where(y_flat == c)[0]
+        if len(idx) > max_per_class:
+            idx = rng.choice(idx, max_per_class, replace=False)
+        X_list.append(X_flat[idx])
+        y_list.append(y_flat[idx])
+
+    return np.concatenate(X_list, axis=0), np.concatenate(y_list, axis=0)
+
+
 # ============================================================
 # Step 6: K-fold Cross Validation Setup (MODIFIED)
 # ============================================================
@@ -346,11 +356,11 @@ kf = KFold(n_splits=len(CROP_IDS), shuffle=True, random_state=42)
 
 # Calculate cumulative pixel count indices to slice X_all_flat and y_all_flat
 # This array tells us where each crop starts in the flattened dataset
-crop_start_indices = np.cumsum([0] + crop_pixel_counts)
+# crop_start_indices = np.cumsum([0] + crop_pixel_counts)
 fold_scores = []
 
 # ============================================================
-# Step 7: Train & Validate (MODIFIED for Crop-based split & Chunking)
+# Step 7: Train & Validate (MEMORY-SAFE VERSION)
 # ============================================================
 
 for fold, (train_crop_idx, val_crop_idx) in tqdm(
@@ -359,37 +369,57 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(
     print(f"\n================ FOLD {fold} ================")
     fold_start = time.time()
 
-    # 1. Build Training Set (Concatenate all selected training crops)
-    X_train_list, y_train_list = [], []
-    for c_idx in train_crop_idx:
-        start = crop_start_indices[c_idx]
-        end = crop_start_indices[c_idx + 1]
-        X_train_list.append(X_all_flat[start:end])
-        y_train_list.append(y_all_flat[start:end])
-    X_train_full = np.concatenate(X_train_list, axis=0)
-    y_train_full = np.concatenate(y_train_list, axis=0)
-
-    # 2. Build Validation Set (Single validation crop)
     val_c_idx = val_crop_idx[0]
-    start = crop_start_indices[val_c_idx]
-    end = crop_start_indices[val_c_idx + 1]
-    X_val = X_all_flat[start:end]
-    y_val = y_all_flat[start:end]
     print(f"FOLD {fold}: Validation Crop ID: {CROP_IDS[val_c_idx]}")
 
     # ------------------------------------------------------------
-    # A. Apply pixel limit to the training set (Sampling)
+    # A. Build TRAIN set by: feature extraction per crop -> sampling per crop -> concat
     # ------------------------------------------------------------
-    # 假设使用 50000 像素作为测试限制
-    PIXEL_LIMIT = 50000
-    print(
-        f"FOLD {fold}: Applying pixel limit of {PIXEL_LIMIT} per class to training data..."
-    )
-    X_train, y_train = limit_class_pixels(
-        X_train_full, y_train_full, max_per_class=PIXEL_LIMIT, random_state=42 + fold
-    )
-    print(f"Fold {fold} Sampled Train set shape:", X_train.shape)
-    print(f"Fold {fold} Val set shape:  ", X_val.shape)
+    PIXEL_LIMIT = 50000  # per class
+    print(f"FOLD {fold}: Building TRAIN set with per-crop sampling limit {PIXEL_LIMIT} per class...")
+
+    X_train_parts, y_train_parts = [], []
+
+    for c_idx in train_crop_idx:
+        crop_id = all_crops_data[c_idx]["id"]
+        raw_crop = all_crops_data[c_idx]["raw"]
+        label_multi = all_crops_data[c_idx]["label"]
+
+        print(f"  [Train] Extracting features for {crop_id}...")
+        X_vol_4d = extract_full_3d_features_40ch(raw_crop)
+        X_flat = X_vol_4d.reshape(-1, n_feats)
+        y_flat = label_multi.reshape(-1)
+
+        # sample immediately (avoid huge X_train_full)
+        X_s, y_s = sample_from_crop(
+            X_flat, y_flat, max_per_class=PIXEL_LIMIT, random_state=42 + fold + c_idx
+        )
+
+        X_train_parts.append(X_s)
+        y_train_parts.append(y_s)
+
+        # free big arrays ASAP
+        del X_vol_4d, X_flat, y_flat, X_s, y_s
+
+    X_train = np.concatenate(X_train_parts, axis=0)
+    y_train = np.concatenate(y_train_parts, axis=0)
+    del X_train_parts, y_train_parts
+
+    print(f"Fold {fold} Sampled Train set shape: {X_train.shape}")
+
+    # ------------------------------------------------------------
+    # B. Build VAL set: full validation crop features (chunked predict later)
+    # ------------------------------------------------------------
+    val_crop_data = all_crops_data[val_c_idx]
+    Dz_val, Dy_val, Dx_val = val_crop_data["shape"]
+
+    print(f"  [Val] Extracting features for {val_crop_data['id']}...")
+    X_val_4d = extract_full_3d_features_40ch(val_crop_data["raw"])
+    X_val = X_val_4d.reshape(-1, n_feats)
+    y_val = val_crop_data["label"].reshape(-1)
+    del X_val_4d
+
+    print(f"Fold {fold} Val set shape:  {X_val.shape}")
 
     # ============================================================
     # Step C: Train RandomForest 🌳
@@ -400,12 +430,14 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(
     )
     clf.fit(X_train, y_train)
 
+    # free train arrays (RF already fitted)
+    del X_train, y_train
+
     # ============================================================
     # Step D & E: Predict & Evaluate (USING CHUNKING)
     # ============================================================
     print("Predicting...")
-    # --- Predict in Chunks ---
-    chunk_size = 8000000
+    chunk_size = 2000000  # ⬅️ 建议比你原来的 8e6 小一些，更稳
     y_pred_list = []
     n_pixels = X_val.shape[0]
     n_chunks = int(np.ceil(n_pixels / chunk_size))
@@ -416,33 +448,23 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(
         X_chunk = X_val[start_idx:end_idx]
         y_pred_chunk = clf.predict(X_chunk)
         y_pred_list.append(y_pred_chunk)
+
     y_pred_flat = np.concatenate(y_pred_list, axis=0)
+    del y_pred_list, X_val  # free val features ASAP
 
-    # 1. Reshape back to 3D for Post-Processing
-    # We need the validation crop shape.
-    # Note: In your loop, Val Set is a single crop, so we can get its shape easily.
-    # We stored 'shape' in all_crops_data. Let's retrieve it.
-    val_crop_data = all_crops_data[val_c_idx]
-    Dz_val, Dy_val, Dx_val = val_crop_data["shape"]
+    # reshape to 3D for median post-processing
     y_pred_3d = y_pred_flat.reshape(Dz_val, Dy_val, Dx_val)
+    del y_pred_flat
 
-    # ============================================================
-    # 🌟 NEW: POST-PROCESSING (Morphological Cleaning)
-    # ============================================================
     print("Applying Post-processing (Median Filter)...")
-    # Median Filter: Replaces each pixel with the median of its neighbors (3x3x3).
-    # effectively removes salt-and-pepper noise and smooths boundaries.
     y_pred_3d_refined = median_filter(y_pred_3d, size=3)
-    # Optional: If you have very specific noise, you can increase size to 5,
-    # but size=3 is usually safest for thin membranes.
+    del y_pred_3d
 
-    # Flatten back for metric calculation
     y_pred_final = y_pred_3d_refined.reshape(-1)
+    del y_pred_3d_refined
 
-    # ============================================================
     print(f"Prediction complete. Final shape: {y_pred_final.shape}")
 
-    # Calculate scores (Using y_pred_final instead of raw prediction)
     iou_per_class = jaccard_score(
         y_val, y_pred_final, average=None, labels=labels_eval, zero_division=0
     )
@@ -453,7 +475,6 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(
     dice_macro = np.mean(dice_per_class)
     print(f"FOLD {fold} Result: IoU_macro={iou_macro:.4f}, Dice_macro={dice_macro:.4f}")
 
-    # Store results
     fold_scores.append(
         {
             "iou_macro": iou_macro,
@@ -462,29 +483,54 @@ for fold, (train_crop_idx, val_crop_idx) in tqdm(
             "dice_per_class": dice_per_class,
         }
     )
+
     elapsed = time.time() - fold_start
     print(f"⏱ Fold {fold} took {elapsed / 60:.2f} minutes")
 
+    # free remaining big arrays
+    del y_val, y_pred_final, clf
+
+
 # ============================================================
-# Step 7.5: Train final model on ALL data (Balanced Sampling) (MINOR MODIFICATION)
+# Step 7.5: Train final model on ALL crops (Memory-safe sampling)
 # ============================================================
 
 print("\n===== Step 7.5: Training final model on ALL data (Balanced Sampling) =====")
 
-# Apply the sampling to the full dataset (X_all_flat, y_all_flat)
-X_sub, y_sub = limit_class_pixels(X_all_flat, y_all_flat, max_per_class=50000)
+PIXEL_LIMIT_FINAL = 50000
+X_parts, y_parts = [], []
+
+for idx, crop_item in enumerate(all_crops_data):
+    print(f"  [Final] Extracting + sampling from {crop_item['id']}...")
+    X_vol_4d = extract_full_3d_features_40ch(crop_item["raw"])
+    X_flat = X_vol_4d.reshape(-1, n_feats)
+    y_flat = crop_item["label"].reshape(-1)
+
+    X_s, y_s = sample_from_crop(
+        X_flat, y_flat, max_per_class=PIXEL_LIMIT_FINAL, random_state=123 + idx
+    )
+    X_parts.append(X_s)
+    y_parts.append(y_s)
+
+    del X_vol_4d, X_flat, y_flat, X_s, y_s
+
+X_sub = np.concatenate(X_parts, axis=0)
+y_sub = np.concatenate(y_parts, axis=0)
+del X_parts, y_parts
 
 print("Training FINAL RandomForest model...")
 
 final_clf = RandomForestClassifier(
     n_estimators=100,
     class_weight="balanced",
-    n_jobs=2,  # Use all cores
+    n_jobs=2,
     random_state=42,
 )
-
 final_clf.fit(X_sub, y_sub)
+
+del X_sub, y_sub
 print("🎉 Final model training complete!")
+
 
 # ============================================================
 # Step 8: Print final aggregated results (NO CHANGE)
@@ -585,7 +631,7 @@ legend_patches = [
 ]
 
 # ---- 3. Iterate through all crops and save slices ----
-num_vis_per_crop = 10
+num_vis_per_crop = 5
 crops_data_dict = {item["id"]: item for item in all_crops_data}
 
 if "final_clf" not in locals():
@@ -600,13 +646,19 @@ else:
         raw_crop_vis = crop_item["raw"]
         label_multi_vis = crop_item["label"]
         Dz, Dy, Dx = crop_item["shape"]
-        feat_vol_4d = crop_item["features_4d"]
+        # feat_vol_4d = crop_item["features_4d"]
+        feat_vol_4d = extract_full_3d_features_40ch(raw_crop_vis)
 
         # Select random Z slices
         if Dz < num_vis_per_crop:
             vis_zs = range(Dz)
         else:
-            vis_zs = random.sample(range(Dz), num_vis_per_crop)
+            # Generate evenly spaced indices from 0 to Dz-1
+            vis_zs = np.linspace(0, Dz - 1, num=num_vis_per_crop, dtype=int).tolist()
+            # Sort and remove duplicates (just in case)
+            vis_zs = sorted(list(set(vis_zs)))
+        # else:
+        #     vis_zs = random.sample(range(Dz), num_vis_per_crop)
 
         for i, vis_z in enumerate(vis_zs):
             # Predict using the classifier on the selected slice

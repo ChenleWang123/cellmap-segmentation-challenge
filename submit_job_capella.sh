@@ -27,6 +27,7 @@ python --version
 cd /home/chwa386g/chwa386g/cellmap-segmentation-challenge/examples
 
 # ===== Run your script =====
+# python main_rf_s1_40d.py
 python main_cnn_s1.py
 
 echo "Job finished at $(date)"

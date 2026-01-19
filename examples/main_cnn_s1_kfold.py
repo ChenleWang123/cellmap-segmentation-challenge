@@ -12,17 +12,15 @@ import random
 import numpy as np
 import zarr  # type: ignore
 from tqdm import tqdm  # type: ignore
-from scipy.ndimage import gaussian_filter, sobel  # type: ignore
-
+from scipy.ndimage import gaussian_filter, sobel, label  # type: ignore
 from sklearn.model_selection import KFold  # type: ignore
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
 import matplotlib.pyplot as plt  # type: ignore
-
+import matplotlib.patches as mpatches
+from datetime import datetime
 
 # -----------------------------
 # Config
@@ -47,7 +45,7 @@ CROP_IDS = [
     "crop292",
 ]
 
-RAW_S0 = r"../data/jrc_cos7-1a/jrc_cos7-1a.zarr/recon-1/em/fibsem-uint8/s0"
+RAW_S0 = r"../data/jrc_cos7-1a/jrc_cos7-1a.zarr/recon-1/em/fibsem-uint8/s1"
 GROUNDTRUTH_ROOT = r"../data/jrc_cos7-1a/jrc_cos7-1a.zarr/recon-1/labels/groundtruth"
 
 SELECT_CLASSES = {
@@ -71,13 +69,13 @@ NUM_CLASSES = 6  # 0..5
 
 # === NEW: CLASS WEIGHTS to address Dice=0 issues ===
 # Weights: [bg, cyto, mito_mem, mito_lum, er_mem, er_lum]
-CLASS_WEIGHTS_LIST = [1.0, 1.0, 10.0, 10.0, 5.0, 5.0]
+CLASS_WEIGHTS_LIST = [3.0, 1.0, 10.0, 10.0, 5.0, 5.0]
 # ===================================================
 
 REF_CLASS = "nucpl"
 
 # Training
-EPOCHS = 20
+EPOCHS = 300
 BATCH_SIZE = 2
 LR = 2e-4
 WEIGHT_DECAY = 1e-5
@@ -88,16 +86,14 @@ PATCHES_PER_EPOCH = 300  # per fold
 VAL_PATCHES = 80
 
 # Sliding-window inference for full volume evaluation
-INFER_STRIDE = (16, 64, 64)  # overlap = patch - stride
+INFER_STRIDE = (4, 32, 32)  # overlap = patch - stride
 
 # Output
-from datetime import datetime
+N_VAL_SLICES = 10
 
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
+# Modified: Base directory. Subfolders for folds will be created inside.
 OUT_DIR = f"../Result/unet3d_runs/run_{RUN_ID}"
-# os.makedirs(OUT_DIR, exist_ok=True)
-# OUT_DIR = "../Result/unet3d_runs"
-# os.makedirs(OUT_DIR, exist_ok=True)
 
 
 # -----------------------------
@@ -129,23 +125,20 @@ def make_cnn_input(raw_uint8_zyx: np.ndarray) -> np.ndarray:
     return x
 
 
-# -----------------------------
-# Data loading (aligned to your method)
-# -----------------------------
 def load_one_crop(crop_id: str, raw_zarr) -> dict:
     """
-    Returns dict:
-      raw: uint8 (Z,Y,X)
-      label: uint8 (Z,Y,X) 0..5
-      id: str
-      shape: (Z,Y,X)
+    Load s1 raw data and downsample s0 labels to match.
+    Assumes s1 is 2x downsampled compared to s0.
     """
+    scale_factor = 2  # s1 is s0 / 2
+    
     crop_root = os.path.join(GROUNDTRUTH_ROOT, crop_id)
     ref_s0 = os.path.join(crop_root, REF_CLASS, "s0")
     ref_zattr = os.path.join(crop_root, REF_CLASS, ".zattrs")
 
+    # 1. Read metadata from s0 (Ground Truth definition)
     ref_arr = zarr.open(ref_s0, mode="r")
-    Dz, Dy, Dx = ref_arr.shape
+    Dz_s0, Dy_s0, Dx_s0 = ref_arr.shape
 
     with open(ref_zattr, "r") as f:
         attrs = json.load(f)
@@ -155,26 +148,60 @@ def load_one_crop(crop_id: str, raw_zarr) -> dict:
     scale_z, scale_y, scale_x = scale
     tz, ty, tx = trans
 
-    vz0 = int(tz / scale_z)
-    vy0 = int(ty / scale_y)
-    vx0 = int(tx / scale_x)
+    # 2. Calculate s0 indices
+    vz0_s0 = int(tz / scale_z)
+    vy0_s0 = int(ty / scale_y)
+    vx0_s0 = int(tx / scale_x)
+    
+    # 3. Convert to s1 indices (Divide by scale_factor)
+    vz0 = vz0_s0 // scale_factor
+    vy0 = vy0_s0 // scale_factor
+    vx0 = vx0_s0 // scale_factor
+    
+    # Calculate s1 shape
+    Dz = Dz_s0 // scale_factor
+    Dy = Dy_s0 // scale_factor
+    Dx = Dx_s0 // scale_factor
+    
     vz1, vy1, vx1 = vz0 + Dz, vy0 + Dy, vx0 + Dx
 
-    raw_crop = raw_zarr[vz0:vz1, vy0:vy1, vx0:vx1]  # uint8 (Z,Y,X)
+    # 4. Load Raw (from s1 path)
+    raw_crop = raw_zarr[vz0:vz1, vy0:vy1, vx0:vx1]
+    raw_crop = gaussian_filter(raw_crop.astype(np.float32), sigma=0.5).astype(np.uint8)
 
-    # Build multi-class label
+    # 5. Build multi-class label (Load s0, then downsample to s1)
     label_multi = np.zeros((Dz, Dy, Dx), dtype=np.uint8)
+    
     for cname in SELECT_CLASSES.keys():
         path = os.path.join(crop_root, cname, "s0")
         try:
-            arr = zarr.open(path, mode="r")[:]  # binary mask
+            # Load s0 mask
+            arr_s0 = zarr.open(path, mode="r")[:] 
+            
+            # Downsample to match s1 (Simple slicing [::2])
+            # CAUTION: Ensure the sliced shape matches label_multi shape
+            arr_s1 = arr_s0[::scale_factor, ::scale_factor, ::scale_factor]
+            
+            # Crop to match exact dimensions if rounding errors occur
+            arr_s1 = arr_s1[:Dz, :Dy, :Dx]
+            
             cid = CLASS_ID_MAP[cname]
-            label_multi[arr > 0] = cid
+            label_multi[arr_s1 > 0] = cid
+            
         except Exception as e:
             print(f"Warning: failed load class {cname} in {crop_id}: {e}")
 
-    return {"raw": raw_crop, "label": label_multi, "shape": (Dz, Dy, Dx), "id": crop_id}
+    # Safety check
+    if raw_crop.shape != label_multi.shape:
+        print(f"Shape Mismatch! Raw: {raw_crop.shape}, Label: {label_multi.shape}")
+        # Force crop to minimum common shape
+        mz = min(raw_crop.shape[0], label_multi.shape[0])
+        my = min(raw_crop.shape[1], label_multi.shape[1])
+        mx = min(raw_crop.shape[2], label_multi.shape[2])
+        raw_crop = raw_crop[:mz, :my, :mx]
+        label_multi = label_multi[:mz, :my, :mx]
 
+    return {"raw": raw_crop, "label": label_multi, "shape": raw_crop.shape, "id": crop_id}
 
 # -----------------------------
 # Patch sampler dataset
@@ -211,11 +238,11 @@ class RandomPatchDataset(Dataset):
         y_patch = crop["label"][z0 : z0 + self.pz, y0 : y0 + self.py, x0 : x0 + self.px]
 
         # -------------------
-        # ✅ modifyd here: ensure patch size is correct
+        # Ensure patch size is correct
         # -------------------
         current_pz = raw_patch.shape[0]
         if current_pz != self.pz:
-             print(f"Warning: Patch size mismatch (Z={current_pz} != {self.pz}). Resampling...")
+             # print(f"Warning: Patch size mismatch (Z={current_pz} != {self.pz}). Resampling...")
              return self.__getitem__(np.random.randint(0, self.n_patches)) 
              
         # Optional: ensure Y and X are also correct
@@ -350,79 +377,160 @@ def dice_per_class(pred, gt, num_classes=6, eps=1e-6):
     return out
 
 
+def remove_small_components(seg, min_voxels=2000):
+    """
+    seg: (Z,Y,X) uint8 segmentation
+    Remove small isolated components for each foreground class.
+    """
+    out = seg.copy()
+
+    for c in range(1, NUM_CLASSES):  # skip background
+        mask = seg == c
+        lab, n = label(mask)
+
+        for i in range(1, n + 1):
+            if (lab == i).sum() < min_voxels:
+                out[lab == i] = 0  # assign to background
+
+    return out
+
+
 # -----------------------------
-# Sliding-window inference
+# High-Quality Sliding-window inference (Gaussian + Mirror Padding)
 # -----------------------------
+def _get_gaussian(patch_size, sigma_scale=1.0 / 8):
+    tmp = np.zeros(patch_size)
+    center_coords = [i // 2 for i in patch_size]
+    sigmas = [i * sigma_scale for i in patch_size]
+    tmp[tuple(center_coords)] = 1
+    gaussian_importance_map = gaussian_filter(tmp, sigmas, 0, mode='constant', cval=0)
+    
+    # Normalize
+    gaussian_importance_map = gaussian_importance_map / np.max(gaussian_importance_map) * 1
+    gaussian_importance_map = gaussian_importance_map.astype(np.float32)
+
+    # Gaussian cannot be 0, otherwise division by zero errors
+    gaussian_importance_map[gaussian_importance_map == 0] = np.min(
+        gaussian_importance_map[gaussian_importance_map != 0]
+    )
+    return gaussian_importance_map
+
 @torch.no_grad()
 def sliding_window_predict(
     model, raw_zyx: np.ndarray, patch_zyx=(32, 128, 128), stride_zyx=(16, 64, 64)
 ):
     """
-    raw_zyx: uint8 (Z,Y,X)
-    returns: pred (Z,Y,X) uint8
+    SOTA Inference: Gaussian Blending + Mirror Padding + TTA (Test Time Augmentation).
     """
     model.eval()
-    C = 3 if USE_GRADMAG2_AS_3RD_CH else 2
-
+    
+    # 1. Pad input (Mirror padding)
     pz, py, px = patch_zyx
+    pad_z, pad_y, pad_x = pz // 2, py // 2, px // 2
+    
+    raw_padded = np.pad(
+        raw_zyx, 
+        ((pad_z, pad_z), (pad_y, pad_y), (pad_x, pad_x)), 
+        mode='reflect'
+    )
+    
+    Dz_pad, Dy_pad, Dx_pad = raw_padded.shape
     sz, sy, sx = stride_zyx
-    Dz, Dy, Dx = raw_zyx.shape
 
-    # score accumulation
-    scores = np.zeros((NUM_CLASSES, Dz, Dy, Dx), dtype=np.float32)
-    counts = np.zeros((Dz, Dy, Dx), dtype=np.float32)
+    # 2. Prepare accumulators
+    scores = np.zeros((NUM_CLASSES, Dz_pad, Dy_pad, Dx_pad), dtype=np.float32)
+    gaussian_weights = np.zeros((Dz_pad, Dy_pad, Dx_pad), dtype=np.float32)
 
-    z_starts = list(range(0, max(Dz - pz, 0) + 1, sz))
-    y_starts = list(range(0, max(Dy - py, 0) + 1, sy))
-    x_starts = list(range(0, max(Dx - px, 0) + 1, sx))
-    if z_starts[-1] != Dz - pz:
-        z_starts.append(Dz - pz)
-    if y_starts[-1] != Dy - py:
-        y_starts.append(Dy - py)
-    if x_starts[-1] != Dx - px:
-        x_starts.append(Dx - px)
+    # 3. Gaussian Window
+    g_window = _get_gaussian(patch_zyx)
+    g_window_torch = torch.from_numpy(g_window).to(DEVICE)
 
-    for z0 in tqdm(z_starts, desc="Infer z"):
+    # 4. Define TTA transforms (Flip axes)
+    tta_dims = [[], [2], [3], [4]] 
+    
+    # 5. Coordinates
+    z_starts = list(range(0, max(Dz_pad - pz, 0) + 1, sz))
+    y_starts = list(range(0, max(Dy_pad - py, 0) + 1, sy))
+    x_starts = list(range(0, max(Dx_pad - px, 0) + 1, sx))
+    
+    if z_starts[-1] != Dz_pad - pz: z_starts.append(Dz_pad - pz)
+    if y_starts[-1] != Dy_pad - py: y_starts.append(Dy_pad - py)
+    if x_starts[-1] != Dx_pad - px: x_starts.append(Dx_pad - px)
+
+    # 6. Main Loop
+    for z0 in tqdm(z_starts, desc="Infer (TTA+Gaussian)"):
         for y0 in y_starts:
             for x0 in x_starts:
-                patch_raw = raw_zyx[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
-                x_patch = make_cnn_input(patch_raw)  # (C,Z,Y,X)
-                x = torch.from_numpy(x_patch).unsqueeze(0).to(DEVICE)  # (1,C,Z,Y,X)
+                patch_raw = raw_padded[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px]
+                
+                if patch_raw.shape != (pz, py, px): continue
 
-                logits = model(x)
-                prob = (
-                    torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-                )  # (K,Z,Y,X)
+                # Prepare Base Input
+                x_in_np = make_cnn_input(patch_raw) # (C, Z, Y, X)
+                x_in = torch.from_numpy(x_in_np).unsqueeze(0).to(DEVICE) # (1, C, Z, Y, X)
+                
+                # --- TTA Loop (Average 4 predictions) ---
+                patch_prob_sum = torch.zeros((NUM_CLASSES, pz, py, px), device=DEVICE)
+                
+                for dims in tta_dims:
+                    if len(dims) == 0:
+                        # Original
+                        logits = model(x_in)
+                    else:
+                        # Flip input -> Predict -> Flip output back
+                        x_flipped = torch.flip(x_in, dims=dims)
+                        logits_flipped = model(x_flipped)
+                        logits = torch.flip(logits_flipped, dims=dims)
+                    
+                    prob = torch.softmax(logits, dim=1).squeeze(0) # (K, Z, Y, X)
+                    patch_prob_sum += prob
+                
+                # Average probabilities
+                avg_prob = patch_prob_sum / len(tta_dims)
 
-                scores[:, z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += prob
-                counts[z0 : z0 + pz, y0 : y0 + py, x0 : x0 + px] += 1.0
+                # Gaussian Weighting
+                avg_prob *= g_window_torch
+                
+                # Accumulate to global volume
+                scores[:, z0:z0+pz, y0:y0+py, x0:x0+px] += avg_prob.cpu().numpy()
+                gaussian_weights[z0:z0+pz, y0:y0+py, x0:x0+px] += g_window
 
-    scores /= np.maximum(counts[None, ...], 1e-6)
-    pred = np.argmax(scores, axis=0).astype(np.uint8)
-    return pred
+    # 7. Normalize & Crop
+    gaussian_weights = np.maximum(gaussian_weights, 1e-6)
+    scores /= gaussian_weights[None, ...]
+    
+    scores = scores[:, pad_z:-pad_z, pad_y:-pad_y, pad_x:-pad_x]
+    
+    return np.argmax(scores, axis=0).astype(np.uint8)
 
 
 # -----------------------------
 # Train one fold
 # -----------------------------
 def train_one_fold(fold_id, train_crops, val_crops):
+    # Modified: Create a unique sub-directory for this fold to avoid overwriting
     run_dir = os.path.join(OUT_DIR, f"fold_{fold_id}")
     os.makedirs(run_dir, exist_ok=True)
+    
+    print(f"\n--- Starting Fold {fold_id} ---")
+    print(f"Train Crops: {[c['id'] for c in train_crops]}")
+    print(f"Valid Crops: {[c['id'] for c in val_crops]}")
+    print(f"Saving to: {run_dir}")
 
     in_ch = 3 if USE_GRADMAG2_AS_3RD_CH else 2
     model = UNet3D(in_ch=in_ch, n_classes=NUM_CLASSES, base=32).to(DEVICE)
 
-    # === NEW: Class Weights Initialization ===
     class_weights = torch.tensor(CLASS_WEIGHTS_LIST, dtype=torch.float32).to(DEVICE)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    # === MODIFIED: Pass weights to CrossEntropyLoss ===
     ce = nn.CrossEntropyLoss(weight=class_weights)
 
     train_ds = RandomPatchDataset(
         train_crops, n_patches=PATCHES_PER_EPOCH, patch_zyx=PATCH_ZYX
     )
-    val_ds = RandomPatchDataset(val_crops, n_patches=VAL_PATCHES, patch_zyx=PATCH_ZYX)
+    val_ds = RandomPatchDataset(
+        val_crops, n_patches=VAL_PATCHES, patch_zyx=PATCH_ZYX
+    )
 
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True
@@ -431,16 +539,22 @@ def train_one_fold(fold_id, train_crops, val_crops):
         val_ds, batch_size=1, shuffle=False, num_workers=1, pin_memory=True
     )
 
+    SAVE_EVERY = 300
     best_val = 1e9
     best_path = os.path.join(run_dir, "best.pt")
 
+    # ===========================
+    # training loop
+    # ===========================
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
         model.train()
         tr_loss = 0.0
 
         for x, y in tqdm(
-            train_loader, desc=f"[Fold {fold_id}] Train epoch {epoch}", leave=False
+            train_loader,
+            desc=f"[Fold {fold_id}] Train ep {epoch}",
+            leave=False,
         ):
             x = x.to(DEVICE)
             y = y.to(DEVICE)
@@ -457,12 +571,14 @@ def train_one_fold(fold_id, train_crops, val_crops):
 
         tr_loss /= max(len(train_loader), 1)
 
-        # val
+        # ---------- validation ----------
         model.eval()
         va_loss = 0.0
         with torch.no_grad():
             for x, y in tqdm(
-                val_loader, desc=f"[Fold {fold_id}] Val epoch {epoch}", leave=False
+                val_loader,
+                desc=f"[Fold {fold_id}] Val ep {epoch}",
+                leave=False,
             ):
                 x = x.to(DEVICE)
                 y = y.to(DEVICE)
@@ -471,68 +587,123 @@ def train_one_fold(fold_id, train_crops, val_crops):
                     logits, y, num_classes=NUM_CLASSES
                 )
                 va_loss += loss.item()
-        va_loss /= max(len(val_loader), 1)
 
+        va_loss /= max(len(val_loader), 1)
         dt = time.time() - t0
+
         print(
-            f"[Fold {fold_id}] Epoch {epoch:02d} | train={tr_loss:.4f} val={va_loss:.4f} | {dt/60:.2f} min"
+            f"[Fold {fold_id}] Ep {epoch:03d} | "
+            f"tr={tr_loss:.4f} val={va_loss:.4f} | {dt/60:.2f} min"
         )
 
-        # save best
+        # ---------- best model ----------
         if va_loss < best_val:
             best_val = va_loss
-            torch.save({"model": model.state_dict(), "in_ch": in_ch}, best_path)
+            torch.save(
+                {"model": model.state_dict(), "in_ch": in_ch},
+                best_path,
+            )
 
-    print(f"[Fold {fold_id}] Best val loss: {best_val:.4f} saved to {best_path}")
+        # ---------- periodic checkpoint ----------
+        # if epoch % SAVE_EVERY == 0:
+        #     ckpt_path = os.path.join(run_dir, f"epoch_{epoch:03d}.pt")
+        #     torch.save(
+        #         {
+        #             "epoch": epoch,
+        #             "model": model.state_dict(),
+        #             "optimizer": optimizer.state_dict(),
+        #             "in_ch": in_ch,
+        #         },
+        #         ckpt_path,
+        #     )
 
-    # Evaluate on full validation crop (first val crop only)
+    print(f"Fold {fold_id} Best val loss: {best_val:.4f}")
+
+    # ===========================
+    # full-volume inference on validation crop
+    # ===========================
     ckpt = torch.load(best_path, map_location=DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
     val_crop = val_crops[0]
-    pred = sliding_window_predict(
-        model, val_crop["raw"], patch_zyx=PATCH_ZYX, stride_zyx=INFER_STRIDE
-    )
 
-    # ===== FIX: align pred and GT =====
+    pred = sliding_window_predict(
+        model,
+        val_crop["raw"],
+        patch_zyx=PATCH_ZYX,
+        stride_zyx=INFER_STRIDE,
+    )
+    pred = remove_small_components(pred, min_voxels=2000)
+
     gt = val_crop["label"]
 
     Z = min(pred.shape[0], gt.shape[0])
     Y = min(pred.shape[1], gt.shape[1])
     X = min(pred.shape[2], gt.shape[2])
-
     pred = pred[:Z, :Y, :X]
-    gt   = gt[:Z, :Y, :X]
-    # ====================================
+    gt = gt[:Z, :Y, :X]
 
-    dices = dice_per_class(pred, val_crop["label"], num_classes=NUM_CLASSES)
-    print(f"[Fold {fold_id}] Full-volume Dice per class:")
+    dices = dice_per_class(pred, gt, num_classes=NUM_CLASSES)
+    print(f"Fold {fold_id} Full-volume Dice per class:")
     for ci, d in enumerate(dices):
         print(f"  {ci}:{CLASS_NAMES[ci]}  Dice={d:.4f}")
 
-    # Save a few slice visualizations
+    # ===========================
+    # save slice visualizations
+    # ===========================
     vis_dir = os.path.join(run_dir, "vis")
     os.makedirs(vis_dir, exist_ok=True)
+
     Dz = val_crop["raw"].shape[0]
-    zs = [0, Dz // 4, Dz // 2, (3 * Dz) // 4, max(0, Dz - 1)]
+    zs = np.linspace(0, Dz - 1, N_VAL_SLICES, dtype=int)
+
+    # Setup Colormap and Legend
+    cmap = plt.get_cmap("tab10")
+    
+    legend_patches = []
+    for i, name in enumerate(CLASS_NAMES):
+        legend_patches.append(mpatches.Patch(color=cmap(i), label=f"{name} ({i})"))
 
     for z in zs:
-        fig = plt.figure(figsize=(18, 6))
+        fig = plt.figure(figsize=(20, 6))
+
+        # --- Raw ---
         plt.subplot(1, 3, 1)
-        plt.title("Raw")
+        plt.title(f"Raw (z={z})")
         plt.imshow(val_crop["raw"][z], cmap="gray")
         plt.axis("off")
+
+        # --- GT ---
         plt.subplot(1, 3, 2)
         plt.title("GT")
-        plt.imshow(val_crop["label"][z], cmap="tab10", vmin=0, vmax=9)
+        plt.imshow(val_crop["label"][z], cmap=cmap, vmin=0, vmax=9)
         plt.axis("off")
+        plt.legend(
+            handles=legend_patches,
+            bbox_to_anchor=(1.05, 1),
+            loc='upper left',
+            borderaxespad=0.,
+            title="Classes"
+        )
+
+        # --- Pred ---
         plt.subplot(1, 3, 3)
         plt.title("Pred")
-        plt.imshow(pred[z], cmap="tab10", vmin=0, vmax=9)
+        plt.imshow(pred[z], cmap=cmap, vmin=0, vmax=9)
         plt.axis("off")
+        plt.legend(
+            handles=legend_patches,
+            bbox_to_anchor=(1.05, 1),
+            loc='upper left',
+            borderaxespad=0.,
+            title="Classes"
+        )
+
         plt.tight_layout()
-        outp = os.path.join(vis_dir, f"val_{val_crop['id']}_z{z:04d}.png")
+        outp = os.path.join(
+            vis_dir, f"fold{fold_id}_val_{val_crop['id']}_z{z:04d}.png"
+        )
         plt.savefig(outp, dpi=200)
         plt.close(fig)
 
@@ -544,7 +715,7 @@ def main():
     raw_zarr = zarr.open(RAW_S0, mode="r")
     print("Raw shape:", raw_zarr.shape)
 
-    # Load all crops into RAM (simple & robust; if OOM, we can stream per-epoch)
+    # -------- load crops --------
     all_crops = []
     print("\n===== Loading crops =====")
     for cid in CROP_IDS:
@@ -553,35 +724,43 @@ def main():
         print("  shape:", c["shape"], "labels:", np.unique(c["label"]))
         all_crops.append(c)
 
-    # KFold on crop index
-    crop_indices = np.arange(len(all_crops))
-    kf = KFold(n_splits=len(all_crops), shuffle=True, random_state=SEED)
+    # ===== Modified: K-Fold Loop =====
+    # Define KFold with n_splits=len(CROP_IDS). 
+    # Since there are 9 crops, this creates 9 folds where:
+    # Train = 8 crops, Val = 1 crop.
+    kf = KFold(n_splits=len(CROP_IDS), shuffle=True, random_state=SEED)
+    
+    all_fold_dices = [] # To store scores from all folds
 
-    fold_losses = []
-    # === NEW: Store all Dice scores for final aggregation ===
-    all_dices = {name: [] for name in CLASS_NAMES}
-    for fold_id, (tr_idx, va_idx) in enumerate(kf.split(crop_indices)):
-        train_crops = [all_crops[i] for i in tr_idx]
-        val_crops = [all_crops[i] for i in va_idx]  # single crop
+    print(f"\n===== Starting K-Fold Cross Validation (K={kf.get_n_splits()}) =====")
+    
+    for fold_id, (train_idx, val_idx) in enumerate(kf.split(all_crops)):
+        print(f"\n" + "=" * 60)
+        
+        # Select crops based on indices provided by KFold
+        train_crops = [all_crops[i] for i in train_idx]
+        val_crops   = [all_crops[i] for i in val_idx]
+        
+        # Train and validate this fold
+        val_loss, fold_dices = train_one_fold(fold_id, train_crops, val_crops)
+        
+        all_fold_dices.append(fold_dices)
 
-        print("\n" + "=" * 60)
-        print(
-            f"FOLD {fold_id} | train={[c['id'] for c in train_crops]} | val={[c['id'] for c in val_crops]}"
-        )
-        loss, dices = train_one_fold(fold_id, train_crops, val_crops)
-        fold_losses.append(loss)
-        for i, d in enumerate(dices):
-            all_dices[CLASS_NAMES[i]].append(d)
-
-    # === NEW: Final K-Fold Summary (Mean and Std Dev) ===
-    print("\n===== K-FOLD FINAL DICE SUMMARY (Mean ± Std Dev) =====")
-    for name, dice_list in all_dices.items():
-        mean_dice = np.mean(dice_list)
-        std_dice = np.std(dice_list)
-        print(f"  {name:10s} | Dice: {mean_dice:.4f} ± {std_dice:.4f}")
-
-    print("\n===== Done =====")
-    print("Fold best val losses:", fold_losses)
+    # ===== Modified: Aggregate Results =====
+    print("\n" + "=" * 60)
+    print("ALL FOLDS COMPLETED")
+    print("=" * 60)
+    
+    # Calculate average Dice per class across all folds
+    all_fold_dices = np.array(all_fold_dices) # Shape: (n_folds, n_classes)
+    avg_dice = np.mean(all_fold_dices, axis=0)
+    
+    print("\nAverage Dice Scores across all folds:")
+    for ci, name in enumerate(CLASS_NAMES):
+        print(f"  {name:10s}: {avg_dice[ci]:.4f}")
+        
+    print(f"\nAverage Macro Dice: {np.mean(avg_dice):.4f}")
+    print(f"All results saved to: {OUT_DIR}")
 
 
 if __name__ == "__main__":
