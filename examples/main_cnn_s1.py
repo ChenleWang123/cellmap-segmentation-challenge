@@ -77,7 +77,7 @@ CLASS_WEIGHTS_LIST = [3.0, 1.0, 10.0, 10.0, 5.0, 5.0]
 REF_CLASS = "nucpl"
 
 # Training
-EPOCHS = 200
+EPOCHS = 300
 BATCH_SIZE = 2
 LR = 2e-4
 WEIGHT_DECAY = 1e-5
